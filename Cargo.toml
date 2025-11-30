@@ -1,0 +1,27 @@
+[package]
+name = "opus-codec"
+version = "0.1.0"
+edition = "2024"
+authors = ["Denis Avvakumov"]
+description = "Safe Rust bindings for the Opus audio codec"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Deniskore/opus-codec"
+homepage = "https://github.com/Deniskore"
+keywords = ["audio", "codec", "compression", "opus", "voice"]
+categories = ["api-bindings", "encoding", "compression", "multimedia::audio"]
+readme = "README.md"
+
+[dependencies]
+
+[build-dependencies]
+cmake = { version = "0.1" }
+bindgen = "0.72.1"
+pkg-config = "0.3"
+
+[features]
+default = []
+dred = []
+system-lib = []
+
+[dev-dependencies]
+tempfile = "3.23.0"
