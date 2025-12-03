@@ -62,3 +62,46 @@ jobs:
         run: choco install ffmpeg --no-progress -y
       - name: cargo test
         run: cargo test
+
+  avx-presume:
+    name: AVX presume feature
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify AVX presume gating
+        run: python scripts/verify_avx.py
+
+  system-lib:
+    name: System Library
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config ffmpeg curl build-essential autoconf automake libtool cmake
+      - name: Verify system lib build and tests
+        run: python scripts/verify_system_lib.py
+
+  dred:
+    name: DRED (bundled)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install deps (ffmpeg + wget for model download)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg wget
+      - name: Build with dred
+        run: cargo build --features dred
+      - name: Test with dred
+        run: cargo test --features dred

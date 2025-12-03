@@ -2,6 +2,12 @@
 
 Safe Rust wrappers around libopus for encoding/decoding Opus audio, with tests that validate core functionality against ffmpeg.
 
+## Features
+
+- `presume-avx2`: Build the bundled libopus with `OPUS_X86_PRESUME_AVX2` on x86/x86_64 targets, assuming AVX/AVX2/FMA support. Ignored when linking against a system libopus.
+- `dred`: Enable libopus DRED support (downloads the model when building the bundled library). The bundled DRED build currently assumes a Unix-like host with `sh`, `wget`, and `tar`, it is not supported on Windows.
+- `system-lib`: Link against a system-provided libopus instead of the bundled sources.
+
 ## License
 
 This crate is licensed under either of
