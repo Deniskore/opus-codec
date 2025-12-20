@@ -1,9 +1,10 @@
 [package]
 name = "opus-codec"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Denis Avvakumov"]
 description = "Safe Rust bindings for the Opus audio codec"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Deniskore/opus-codec"
 homepage = "https://github.com/Deniskore"

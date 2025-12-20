@@ -13,6 +13,7 @@ mod bindings {
     include!("bindings.rs");
 }
 
+mod alloc;
 pub mod constants;
 pub mod decoder;
 #[cfg(feature = "dred")]
@@ -23,19 +24,21 @@ pub mod error;
 pub mod multistream;
 pub mod packet;
 pub mod projection;
+mod raw;
 pub mod repacketizer;
 pub mod types;
 
+pub use alloc::AlignedBuffer;
 pub use constants::{MAX_FRAME_SAMPLES_48KHZ, MAX_PACKET_DURATION_MS, max_frame_samples_for};
 pub use decoder::Decoder;
 #[cfg(feature = "dred")]
 pub use dred::{DredDecoder, DredState};
 pub use encoder::Encoder;
 pub use error::{Error, Result};
-pub use multistream::{MSDecoder, MSEncoder, Mapping};
+pub use multistream::{Mapping, MultistreamDecoder, MultistreamEncoder};
 pub use packet::{
-    packet_bandwidth, packet_channels, packet_has_lbrr, packet_nb_frames, packet_nb_samples,
-    packet_parse, packet_samples_per_frame, soft_clip,
+    packet_bandwidth, packet_channels, packet_frame_count, packet_has_lbrr, packet_parse,
+    packet_sample_count, packet_samples_per_frame, soft_clip,
 };
 pub use projection::{ProjectionDecoder, ProjectionEncoder};
 pub use repacketizer::Repacketizer;
@@ -46,6 +49,20 @@ pub use types::{
 
 #[doc(hidden)]
 pub use bindings::*;
+
+pub(crate) use raw::RawHandle;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    Owned,
+    Borrowed,
+}
+
+#[inline]
+pub(crate) fn opus_ptr_is_aligned(ptr: *const u8) -> bool {
+    // libopus aligns internal state to pointer-sized alignment (opus_private.h align()).
+    (ptr as usize).is_multiple_of(std::mem::align_of::<usize>())
+}
 
 /// Returns the bundled libopus version string of this crate.
 #[must_use]

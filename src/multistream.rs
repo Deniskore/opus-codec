@@ -19,19 +19,28 @@ use crate::bindings::{
     OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
     OpusDecoder, OpusEncoder, OpusMSDecoder, OpusMSEncoder, opus_multistream_decode,
     opus_multistream_decode_float, opus_multistream_decoder_create, opus_multistream_decoder_ctl,
-    opus_multistream_decoder_destroy, opus_multistream_encode, opus_multistream_encode_float,
+    opus_multistream_decoder_destroy, opus_multistream_decoder_get_size,
+    opus_multistream_decoder_init, opus_multistream_encode, opus_multistream_encode_float,
     opus_multistream_encoder_create, opus_multistream_encoder_ctl,
-    opus_multistream_encoder_destroy, opus_multistream_surround_encoder_create,
+    opus_multistream_encoder_destroy, opus_multistream_encoder_get_size,
+    opus_multistream_encoder_init, opus_multistream_surround_encoder_create,
+    opus_multistream_surround_encoder_get_size, opus_multistream_surround_encoder_init,
 };
+use crate::constants::max_frame_samples_for;
 use crate::error::{Error, Result};
 use crate::types::{Application, Bandwidth, Bitrate, Channels, Complexity, SampleRate, Signal};
+use crate::{AlignedBuffer, Ownership, RawHandle};
+use std::marker::PhantomData;
+use std::num::{NonZeroU8, NonZeroUsize};
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// Describes the multistream mapping configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct Mapping<'a> {
     /// Total input/output channels.
     pub channels: u8,
-    /// Number of uncoupled mono streams.
+    /// Total number of streams (coupled + uncoupled).
     pub streams: u8,
     /// Number of coupled stereo streams (each counts as 2 channels).
     pub coupled_streams: u8,
@@ -40,63 +49,233 @@ pub struct Mapping<'a> {
 }
 
 impl Mapping<'_> {
-    /// Validate that mapping length matches channels.
-    fn validate(&self) -> Result<()> {
-        let channel_count = usize::from(self.channels);
-        if channel_count == 0 {
-            return Err(Error::BadArg);
-        }
+    fn validate_common(&self) -> Result<(usize, usize, usize)> {
+        let channel_count = NonZeroU8::new(self.channels).ok_or(Error::BadArg)?;
+        let channel_count = usize::from(channel_count.get());
         if self.mapping.len() != channel_count {
             return Err(Error::BadArg);
         }
 
-        let streams = usize::from(self.streams);
+        let streams = NonZeroU8::new(self.streams).ok_or(Error::BadArg)?;
+        let streams = usize::from(streams.get());
         let coupled = usize::from(self.coupled_streams);
-        if streams + coupled == 0 {
+        if coupled > streams {
             return Err(Error::BadArg);
         }
-        if streams > channel_count {
-            return Err(Error::BadArg);
-        }
-        if coupled > channel_count / 2 {
+        if streams + coupled > u8::MAX as usize {
             return Err(Error::BadArg);
         }
         let total_streams = streams + coupled;
-        let mut assignments = vec![0usize; total_streams];
+        for &entry in self.mapping {
+            if entry == u8::MAX {
+                continue;
+            }
+            if usize::from(entry) >= total_streams {
+                return Err(Error::BadArg);
+            }
+        }
+        Ok((channel_count, streams, coupled))
+    }
+
+    /// Validate mapping for use with libopus multistream decoder.
+    fn validate_for_decoder(&self) -> Result<()> {
+        self.validate_common()?;
+        Ok(())
+    }
+
+    /// Validate mapping for use with libopus multistream encoder.
+    fn validate_for_encoder(&self) -> Result<()> {
+        let (channel_count, streams, coupled) = self.validate_common()?;
+        if streams + coupled > channel_count {
+            return Err(Error::BadArg);
+        }
+
+        let mut has_left = vec![false; coupled];
+        let mut has_right = vec![false; coupled];
+        let mut has_mono = vec![false; streams.saturating_sub(coupled)];
         for &entry in self.mapping {
             if entry == u8::MAX {
                 continue;
             }
             let idx = usize::from(entry);
-            if idx >= total_streams {
-                return Err(Error::BadArg);
-            }
-            assignments[idx] += 1;
-            if idx < streams {
-                if assignments[idx] > 1 {
-                    return Err(Error::BadArg);
+            if idx < 2 * coupled {
+                let stream = idx / 2;
+                if idx % 2 == 0 {
+                    has_left[stream] = true;
+                } else {
+                    has_right[stream] = true;
                 }
-            } else if assignments[idx] > 2 {
-                return Err(Error::BadArg);
+            } else {
+                let stream = idx - coupled;
+                if stream >= coupled && stream < streams {
+                    has_mono[stream - coupled] = true;
+                }
             }
+        }
+
+        if has_left.iter().any(|has| !has) || has_right.iter().any(|has| !has) {
+            return Err(Error::BadArg);
+        }
+        if has_mono.iter().any(|has| !has) {
+            return Err(Error::BadArg);
         }
         Ok(())
     }
 }
 
 /// Safe wrapper around `OpusMSEncoder`.
-pub struct MSEncoder {
-    raw: *mut OpusMSEncoder,
+pub struct MultistreamEncoder {
+    raw: RawHandle<OpusMSEncoder>,
     sample_rate: SampleRate,
     channels: u8,
     streams: u8,
     coupled_streams: u8,
 }
 
-unsafe impl Send for MSEncoder {}
-unsafe impl Sync for MSEncoder {}
+unsafe impl Send for MultistreamEncoder {}
+unsafe impl Sync for MultistreamEncoder {}
 
-impl MSEncoder {
+/// Borrowed wrapper around a multistream encoder.
+pub struct MultistreamEncoderRef<'a> {
+    inner: MultistreamEncoder,
+    _marker: PhantomData<&'a mut OpusMSEncoder>,
+}
+
+unsafe impl Send for MultistreamEncoderRef<'_> {}
+unsafe impl Sync for MultistreamEncoderRef<'_> {}
+
+impl MultistreamEncoder {
+    fn from_raw(
+        ptr: NonNull<OpusMSEncoder>,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        ownership: Ownership,
+    ) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_multistream_encoder_destroy),
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+        }
+    }
+
+    /// Size in bytes of a multistream encoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the stream counts are invalid or libopus reports
+    /// an impossible size.
+    pub fn size(streams: u8, coupled_streams: u8) -> Result<usize> {
+        let raw = unsafe {
+            opus_multistream_encoder_get_size(i32::from(streams), i32::from(coupled_streams))
+        };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Size in bytes of a surround multistream encoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the channel/mapping configuration is invalid.
+    pub fn surround_size(channels: u8, mapping_family: i32) -> Result<usize> {
+        let raw = unsafe {
+            opus_multistream_surround_encoder_get_size(i32::from(channels), mapping_family)
+        };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Initialize a previously allocated multistream encoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `MultistreamEncoder::size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the mapping is invalid or `ptr` is null, or a
+    /// mapped libopus error on failure.
+    pub unsafe fn init_in_place(
+        ptr: *mut OpusMSEncoder,
+        sr: SampleRate,
+        app: Application,
+        mapping: Mapping<'_>,
+    ) -> Result<()> {
+        if ptr.is_null() {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        mapping.validate_for_encoder()?;
+        let r = unsafe {
+            opus_multistream_encoder_init(
+                ptr,
+                sr as i32,
+                i32::from(mapping.channels),
+                i32::from(mapping.streams),
+                i32::from(mapping.coupled_streams),
+                mapping.mapping.as_ptr(),
+                app as i32,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
+
+    /// Initialize a previously allocated surround multistream encoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `MultistreamEncoder::surround_size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] for invalid channel counts or a mapped libopus error.
+    pub unsafe fn init_surround_in_place(
+        ptr: *mut OpusMSEncoder,
+        sr: SampleRate,
+        channels: u8,
+        mapping_family: i32,
+        app: Application,
+    ) -> Result<(u8, u8, Vec<u8>)> {
+        if ptr.is_null() || channels == 0 {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        let mut streams = 0i32;
+        let mut coupled = 0i32;
+        let mut mapping = vec![0u8; channels as usize];
+        let r = unsafe {
+            opus_multistream_surround_encoder_init(
+                ptr,
+                sr as i32,
+                i32::from(channels),
+                mapping_family,
+                std::ptr::addr_of_mut!(streams),
+                std::ptr::addr_of_mut!(coupled),
+                mapping.as_mut_ptr(),
+                app as i32,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok((
+            u8::try_from(streams).map_err(|_| Error::BadArg)?,
+            u8::try_from(coupled).map_err(|_| Error::BadArg)?,
+            mapping,
+        ))
+    }
+
     /// Create a new multistream encoder.
     ///
     /// The `mapping.mapping` array describes how input channels are assigned to streams.
@@ -106,7 +285,7 @@ impl MSEncoder {
     /// Returns [`Error::BadArg`] when the mapping dimensions are inconsistent, or
     /// propagates allocation/configuration failures from libopus.
     pub fn new(sr: SampleRate, app: Application, mapping: Mapping<'_>) -> Result<Self> {
-        mapping.validate()?;
+        mapping.validate_for_encoder()?;
         let mut err = 0i32;
         let enc = unsafe {
             opus_multistream_encoder_create(
@@ -122,16 +301,15 @@ impl MSEncoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if enc.is_null() {
-            return Err(Error::AllocFail);
-        }
-        Ok(Self {
-            raw: enc,
-            sample_rate: sr,
-            channels: mapping.channels,
-            streams: mapping.streams,
-            coupled_streams: mapping.coupled_streams,
-        })
+        let enc = NonNull::new(enc).ok_or(Error::AllocFail)?;
+        Ok(Self::from_raw(
+            enc,
+            sr,
+            mapping.channels,
+            mapping.streams,
+            mapping.coupled_streams,
+            Ownership::Owned,
+        ))
     }
 
     /// Encode interleaved i16 PCM into a multistream Opus packet.
@@ -146,10 +324,11 @@ impl MSEncoder {
         frame_size_per_ch: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
+        let frame_size_per_ch = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size_per_ch.get() > max_frame_samples_for(self.sample_rate) {
+            return Err(Error::BadArg);
         }
-        if pcm.len() != frame_size_per_ch * self.channels as usize {
+        if pcm.len() != frame_size_per_ch.get() * self.channels as usize {
             return Err(Error::BadArg);
         }
         if out.is_empty() || out.len() > i32::MAX as usize {
@@ -157,9 +336,9 @@ impl MSEncoder {
         }
         let n = unsafe {
             opus_multistream_encode(
-                self.raw,
+                self.raw.as_ptr(),
                 pcm.as_ptr(),
-                i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)?,
+                i32::try_from(frame_size_per_ch.get()).map_err(|_| Error::BadArg)?,
                 out.as_mut_ptr(),
                 i32::try_from(out.len()).map_err(|_| Error::BadArg)?,
             )
@@ -181,10 +360,11 @@ impl MSEncoder {
         frame_size_per_ch: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
+        let frame_size_per_ch = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size_per_ch.get() > max_frame_samples_for(self.sample_rate) {
+            return Err(Error::BadArg);
         }
-        if pcm.len() != frame_size_per_ch * self.channels as usize {
+        if pcm.len() != frame_size_per_ch.get() * self.channels as usize {
             return Err(Error::BadArg);
         }
         if out.is_empty() || out.len() > i32::MAX as usize {
@@ -192,9 +372,9 @@ impl MSEncoder {
         }
         let n = unsafe {
             opus_multistream_encode_float(
-                self.raw,
+                self.raw.as_ptr(),
                 pcm.as_ptr(),
-                i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)?,
+                i32::try_from(frame_size_per_ch.get()).map_err(|_| Error::BadArg)?,
                 out.as_mut_ptr(),
                 i32::try_from(out.len()).map_err(|_| Error::BadArg)?,
             )
@@ -211,12 +391,13 @@ impl MSEncoder {
     /// Returns [`Error::InvalidState`] when the encoder handle is null or
     /// propagates the libopus error.
     pub fn final_range(&mut self) -> Result<u32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v: u32 = 0;
         let r = unsafe {
-            opus_multistream_encoder_ctl(self.raw, OPUS_GET_FINAL_RANGE_REQUEST as i32, &mut v)
+            opus_multistream_encoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_GET_FINAL_RANGE_REQUEST as i32,
+                &mut v,
+            )
         };
         if r != 0 {
             return Err(Error::from_code(r));
@@ -459,6 +640,7 @@ impl MSEncoder {
     pub fn signal(&mut self) -> Result<Signal> {
         let v = self.get_int_ctl(OPUS_GET_SIGNAL_REQUEST as i32)?;
         match v {
+            x if x == OPUS_AUTO => Ok(Signal::Auto),
             x if x == OPUS_SIGNAL_VOICE as i32 => Ok(Signal::Voice),
             x if x == OPUS_SIGNAL_MUSIC as i32 => Ok(Signal::Music),
             _ => Err(Error::InternalError),
@@ -480,10 +662,7 @@ impl MSEncoder {
     /// Returns [`Error::InvalidState`] if the encoder handle is null or propagates any error
     /// reported by libopus.
     pub fn reset(&mut self) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_multistream_encoder_ctl(self.raw, OPUS_RESET_STATE as i32) };
+        let r = unsafe { opus_multistream_encoder_ctl(self.raw.as_ptr(), OPUS_RESET_STATE as i32) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -544,19 +723,11 @@ impl MSEncoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if enc.is_null() {
-            return Err(Error::AllocFail);
-        }
+        let enc = NonNull::new(enc).ok_or(Error::AllocFail)?;
         let streams_u8 = u8::try_from(streams).map_err(|_| Error::BadArg)?;
         let coupled_u8 = u8::try_from(coupled).map_err(|_| Error::BadArg)?;
         Ok((
-            Self {
-                raw: enc,
-                sample_rate: sr,
-                channels,
-                streams: streams_u8,
-                coupled_streams: coupled_u8,
-            },
+            Self::from_raw(enc, sr, channels, streams_u8, coupled_u8, Ownership::Owned),
             mapping,
         ))
     }
@@ -571,13 +742,10 @@ impl MSEncoder {
     /// Returns [`Error::InvalidState`] if the encoder handle is invalid or propagates the
     /// libopus error if retrieving the state fails.
     pub unsafe fn encoder_state_ptr(&mut self, stream_index: i32) -> Result<*mut OpusEncoder> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut state: *mut OpusEncoder = std::ptr::null_mut();
         let r = unsafe {
             opus_multistream_encoder_ctl(
-                self.raw,
+                self.raw.as_ptr(),
                 OPUS_MULTISTREAM_GET_ENCODER_STATE_REQUEST as i32,
                 stream_index,
                 &mut state,
@@ -593,10 +761,7 @@ impl MSEncoder {
     }
 
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_multistream_encoder_ctl(self.raw, req, val) };
+        let r = unsafe { opus_multistream_encoder_ctl(self.raw.as_ptr(), req, val) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -604,11 +769,8 @@ impl MSEncoder {
     }
 
     fn get_int_ctl(&mut self, req: i32) -> Result<i32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v: i32 = 0;
-        let r = unsafe { opus_multistream_encoder_ctl(self.raw, req, &mut v) };
+        let r = unsafe { opus_multistream_encoder_ctl(self.raw.as_ptr(), req, &mut v) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -632,30 +794,190 @@ impl MSEncoder {
     }
 }
 
-impl Drop for MSEncoder {
-    fn drop(&mut self) {
-        unsafe { opus_multistream_encoder_destroy(self.raw) }
+impl<'a> MultistreamEncoderRef<'a> {
+    /// Wrap an externally-initialized multistream encoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`MultistreamEncoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`MultistreamEncoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(ptr: *mut OpusMSEncoder, sr: SampleRate, mapping: Mapping<'_>) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        debug_assert!(mapping.validate_for_encoder().is_ok());
+        let encoder = MultistreamEncoder::from_raw(
+            unsafe { NonNull::new_unchecked(ptr) },
+            sr,
+            mapping.channels,
+            mapping.streams,
+            mapping.coupled_streams,
+            Ownership::Borrowed,
+        );
+        Self {
+            inner: encoder,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(
+        buf: &'a mut AlignedBuffer,
+        sr: SampleRate,
+        app: Application,
+        mapping: Mapping<'_>,
+    ) -> Result<Self> {
+        let required = MultistreamEncoder::size(mapping.streams, mapping.coupled_streams)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusMSEncoder>();
+        unsafe { MultistreamEncoder::init_in_place(ptr, sr, app, mapping)? };
+        Ok(unsafe { Self::from_raw(ptr, sr, mapping) })
+    }
+
+    /// Initialize a surround encoder in an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in_surround(
+        buf: &'a mut AlignedBuffer,
+        sr: SampleRate,
+        channels: u8,
+        mapping_family: i32,
+        app: Application,
+    ) -> Result<(Self, Vec<u8>)> {
+        let required = MultistreamEncoder::surround_size(channels, mapping_family)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusMSEncoder>();
+        let (streams, coupled, mapping) = unsafe {
+            MultistreamEncoder::init_surround_in_place(ptr, sr, channels, mapping_family, app)?
+        };
+        let mapping_ref = Mapping {
+            channels,
+            streams,
+            coupled_streams: coupled,
+            mapping: &mapping,
+        };
+        let encoder = unsafe { Self::from_raw(ptr, sr, mapping_ref) };
+        Ok((encoder, mapping))
+    }
+}
+
+impl Deref for MultistreamEncoderRef<'_> {
+    type Target = MultistreamEncoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MultistreamEncoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
 /// Safe wrapper around `OpusMSDecoder`.
-pub struct MSDecoder {
-    raw: *mut OpusMSDecoder,
+pub struct MultistreamDecoder {
+    raw: RawHandle<OpusMSDecoder>,
     sample_rate: SampleRate,
     channels: u8,
 }
 
-unsafe impl Send for MSDecoder {}
-unsafe impl Sync for MSDecoder {}
+unsafe impl Send for MultistreamDecoder {}
+unsafe impl Sync for MultistreamDecoder {}
 
-impl MSDecoder {
+/// Borrowed wrapper around a multistream decoder.
+pub struct MultistreamDecoderRef<'a> {
+    inner: MultistreamDecoder,
+    _marker: PhantomData<&'a mut OpusMSDecoder>,
+}
+
+unsafe impl Send for MultistreamDecoderRef<'_> {}
+unsafe impl Sync for MultistreamDecoderRef<'_> {}
+
+impl MultistreamDecoder {
+    fn from_raw(
+        ptr: NonNull<OpusMSDecoder>,
+        sample_rate: SampleRate,
+        channels: u8,
+        ownership: Ownership,
+    ) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_multistream_decoder_destroy),
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Size in bytes of a multistream decoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the stream counts are invalid or libopus reports
+    /// an impossible size.
+    pub fn size(streams: u8, coupled_streams: u8) -> Result<usize> {
+        let raw = unsafe {
+            opus_multistream_decoder_get_size(i32::from(streams), i32::from(coupled_streams))
+        };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Initialize a previously allocated multistream decoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `MultistreamDecoder::size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the mapping is invalid or `ptr` is null, or a
+    /// mapped libopus error on failure.
+    pub unsafe fn init_in_place(
+        ptr: *mut OpusMSDecoder,
+        sr: SampleRate,
+        mapping: Mapping<'_>,
+    ) -> Result<()> {
+        if ptr.is_null() {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        mapping.validate_for_decoder()?;
+        let r = unsafe {
+            opus_multistream_decoder_init(
+                ptr,
+                sr as i32,
+                i32::from(mapping.channels),
+                i32::from(mapping.streams),
+                i32::from(mapping.coupled_streams),
+                mapping.mapping.as_ptr(),
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
+
     /// Create a new multistream decoder.
     ///
     /// # Errors
     /// Returns [`Error::BadArg`] when the mapping dimensions are inconsistent, or
     /// propagates allocation/configuration failures from libopus.
     pub fn new(sr: SampleRate, mapping: Mapping<'_>) -> Result<Self> {
-        mapping.validate()?;
+        mapping.validate_for_decoder()?;
         let mut err = 0i32;
         let dec = unsafe {
             opus_multistream_decoder_create(
@@ -670,14 +992,8 @@ impl MSDecoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if dec.is_null() {
-            return Err(Error::AllocFail);
-        }
-        Ok(Self {
-            raw: dec,
-            sample_rate: sr,
-            channels: mapping.channels,
-        })
+        let dec = NonNull::new(dec).ok_or(Error::AllocFail)?;
+        Ok(Self::from_raw(dec, sr, mapping.channels, Ownership::Owned))
     }
 
     /// Decode into interleaved i16 PCM (`frame_size` is per-channel).
@@ -692,15 +1008,16 @@ impl MSDecoder {
         frame_size_per_ch: usize,
         fec: bool,
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
+        let frame_size_per_ch = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size_per_ch.get() > max_frame_samples_for(self.sample_rate) {
+            return Err(Error::BadArg);
         }
-        if out.len() != frame_size_per_ch * self.channels as usize {
+        if out.len() != frame_size_per_ch.get() * self.channels as usize {
             return Err(Error::BadArg);
         }
         let n = unsafe {
             opus_multistream_decode(
-                self.raw,
+                self.raw.as_ptr(),
                 if packet.is_empty() {
                     std::ptr::null()
                 } else {
@@ -712,7 +1029,7 @@ impl MSDecoder {
                     i32::try_from(packet.len()).map_err(|_| Error::BadArg)?
                 },
                 out.as_mut_ptr(),
-                i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)?,
+                i32::try_from(frame_size_per_ch.get()).map_err(|_| Error::BadArg)?,
                 i32::from(fec),
             )
         };
@@ -734,15 +1051,16 @@ impl MSDecoder {
         frame_size_per_ch: usize,
         fec: bool,
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
+        let frame_size_per_ch = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size_per_ch.get() > max_frame_samples_for(self.sample_rate) {
+            return Err(Error::BadArg);
         }
-        if out.len() != frame_size_per_ch * self.channels as usize {
+        if out.len() != frame_size_per_ch.get() * self.channels as usize {
             return Err(Error::BadArg);
         }
         let n = unsafe {
             opus_multistream_decode_float(
-                self.raw,
+                self.raw.as_ptr(),
                 if packet.is_empty() {
                     std::ptr::null()
                 } else {
@@ -754,7 +1072,7 @@ impl MSDecoder {
                     i32::try_from(packet.len()).map_err(|_| Error::BadArg)?
                 },
                 out.as_mut_ptr(),
-                i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)?,
+                i32::try_from(frame_size_per_ch.get()).map_err(|_| Error::BadArg)?,
                 i32::from(fec),
             )
         };
@@ -770,12 +1088,13 @@ impl MSDecoder {
     /// Returns [`Error::InvalidState`] when the decoder handle is null or
     /// propagates the libopus error.
     pub fn final_range(&mut self) -> Result<u32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v: u32 = 0;
         let r = unsafe {
-            opus_multistream_decoder_ctl(self.raw, OPUS_GET_FINAL_RANGE_REQUEST as i32, &mut v)
+            opus_multistream_decoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_GET_FINAL_RANGE_REQUEST as i32,
+                &mut v,
+            )
         };
         if r != 0 {
             return Err(Error::from_code(r));
@@ -789,10 +1108,7 @@ impl MSDecoder {
     /// Returns [`Error::InvalidState`] if the decoder handle is null or propagates any error
     /// reported by libopus.
     pub fn reset(&mut self) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_multistream_decoder_ctl(self.raw, OPUS_RESET_STATE as i32) };
+        let r = unsafe { opus_multistream_decoder_ctl(self.raw.as_ptr(), OPUS_RESET_STATE as i32) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -926,15 +1242,9 @@ impl MSDecoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if dec.is_null() {
-            return Err(Error::AllocFail);
-        }
+        let dec = NonNull::new(dec).ok_or(Error::AllocFail)?;
         Ok((
-            Self {
-                raw: dec,
-                sample_rate: sr,
-                channels,
-            },
+            Self::from_raw(dec, sr, channels, Ownership::Owned),
             mapping,
             u8::try_from(streams).map_err(|_| Error::BadArg)?,
             u8::try_from(coupled).map_err(|_| Error::BadArg)?,
@@ -951,13 +1261,10 @@ impl MSDecoder {
     /// Returns [`Error::InvalidState`] if the decoder handle is invalid or propagates the
     /// libopus error when retrieving the per-stream state fails.
     pub unsafe fn decoder_state_ptr(&mut self, stream_index: i32) -> Result<*mut OpusDecoder> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut state: *mut OpusDecoder = std::ptr::null_mut();
         let r = unsafe {
             opus_multistream_decoder_ctl(
-                self.raw,
+                self.raw.as_ptr(),
                 OPUS_MULTISTREAM_GET_DECODER_STATE_REQUEST as i32,
                 stream_index,
                 &mut state,
@@ -973,10 +1280,7 @@ impl MSDecoder {
     }
 
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_multistream_decoder_ctl(self.raw, req, val) };
+        let r = unsafe { opus_multistream_decoder_ctl(self.raw.as_ptr(), req, val) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -984,11 +1288,8 @@ impl MSDecoder {
     }
 
     fn get_int_ctl(&mut self, req: i32) -> Result<i32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v: i32 = 0;
-        let r = unsafe { opus_multistream_decoder_ctl(self.raw, req, &mut v) };
+        let r = unsafe { opus_multistream_decoder_ctl(self.raw.as_ptr(), req, &mut v) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -1000,9 +1301,63 @@ impl MSDecoder {
     }
 }
 
-impl Drop for MSDecoder {
-    fn drop(&mut self) {
-        unsafe { opus_multistream_decoder_destroy(self.raw) }
+impl<'a> MultistreamDecoderRef<'a> {
+    /// Wrap an externally-initialized multistream decoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`MultistreamDecoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`MultistreamDecoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(ptr: *mut OpusMSDecoder, sr: SampleRate, mapping: Mapping<'_>) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        debug_assert!(mapping.validate_for_decoder().is_ok());
+        let decoder = MultistreamDecoder::from_raw(
+            unsafe { NonNull::new_unchecked(ptr) },
+            sr,
+            mapping.channels,
+            Ownership::Borrowed,
+        );
+        Self {
+            inner: decoder,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(
+        buf: &'a mut AlignedBuffer,
+        sr: SampleRate,
+        mapping: Mapping<'_>,
+    ) -> Result<Self> {
+        let required = MultistreamDecoder::size(mapping.streams, mapping.coupled_streams)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusMSDecoder>();
+        unsafe { MultistreamDecoder::init_in_place(ptr, sr, mapping)? };
+        Ok(unsafe { Self::from_raw(ptr, sr, mapping) })
+    }
+}
+
+impl Deref for MultistreamDecoderRef<'_> {
+    type Target = MultistreamDecoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MultistreamDecoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -1014,21 +1369,22 @@ mod tests {
     fn mapping_allows_dropped_channels() {
         let mapping = Mapping {
             channels: 6,
-            streams: 1,
-            coupled_streams: 2,
-            mapping: &[0, 1, 1, 2, 2, u8::MAX],
+            streams: 2,
+            coupled_streams: 1,
+            mapping: &[0, 1, 2, u8::MAX, u8::MAX, u8::MAX],
         };
-        assert!(mapping.validate().is_ok());
+        assert!(mapping.validate_for_encoder().is_ok());
     }
 
     #[test]
-    fn mapping_rejects_duplicate_mono_assignments() {
+    fn mapping_requires_encoder_stream_coverage() {
         let mapping = Mapping {
-            channels: 3,
+            channels: 2,
             streams: 1,
             coupled_streams: 1,
-            mapping: &[0, 0, 1],
+            mapping: &[0, 0],
         };
-        assert!(mapping.validate().is_err());
+        assert!(mapping.validate_for_decoder().is_ok());
+        assert!(mapping.validate_for_encoder().is_err());
     }
 }
