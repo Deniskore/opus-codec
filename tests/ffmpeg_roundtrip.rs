@@ -5,7 +5,7 @@ use std::process::Command;
 use tempfile::NamedTempFile;
 
 use opus_codec::{Application, Channels, Decoder, Encoder, SampleRate};
-use opus_codec::{MSDecoder, MSEncoder, Mapping};
+use opus_codec::{Mapping, MultistreamDecoder, MultistreamEncoder};
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg").arg("-version").output().is_ok()
@@ -185,14 +185,14 @@ fn test_multistream_basic_stereo_roundtrip() {
         coupled_streams: 1,
         mapping: &[0, 1],
     };
-    let mut enc = MSEncoder::new(sr, Application::Audio, mapping).expect("ms encoder");
+    let mut enc = MultistreamEncoder::new(sr, Application::Audio, mapping).expect("ms encoder");
     let mapping_dec = Mapping {
         channels,
         streams: 1,
         coupled_streams: 1,
         mapping: &[0, 1],
     };
-    let mut dec = MSDecoder::new(sr, mapping_dec).expect("ms decoder");
+    let mut dec = MultistreamDecoder::new(sr, mapping_dec).expect("ms decoder");
 
     // Generate 20 ms stereo sine
     let frame = 960usize; // per channel

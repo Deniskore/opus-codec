@@ -15,16 +15,22 @@ use crate::bindings::{
     OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, OPUS_SET_PREDICTION_DISABLED_REQUEST,
     OPUS_SET_SIGNAL_REQUEST, OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OpusEncoder,
     opus_encode, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
+    opus_encoder_get_size, opus_encoder_init,
 };
 use crate::constants::max_frame_samples_for;
 use crate::error::{Error, Result};
 use crate::types::{
     Application, Bandwidth, Bitrate, Channels, Complexity, ExpertFrameDuration, SampleRate, Signal,
 };
+use crate::{AlignedBuffer, Ownership, RawHandle};
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// Safe wrapper around a libopus `OpusEncoder`.
 pub struct Encoder {
-    raw: *mut OpusEncoder,
+    raw: RawHandle<OpusEncoder>,
     sample_rate: SampleRate,
     channels: Channels,
 }
@@ -32,7 +38,76 @@ pub struct Encoder {
 unsafe impl Send for Encoder {}
 unsafe impl Sync for Encoder {}
 
+/// Borrowed wrapper around an encoder state.
+pub struct EncoderRef<'a> {
+    inner: Encoder,
+    _marker: PhantomData<&'a mut OpusEncoder>,
+}
+
+unsafe impl Send for EncoderRef<'_> {}
+unsafe impl Sync for EncoderRef<'_> {}
+
 impl Encoder {
+    fn from_raw(
+        ptr: NonNull<OpusEncoder>,
+        sample_rate: SampleRate,
+        channels: Channels,
+        ownership: Ownership,
+    ) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_encoder_destroy),
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Size in bytes of an encoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the channel count is invalid or libopus reports
+    /// an impossible size.
+    pub fn size(channels: Channels) -> Result<usize> {
+        let raw = unsafe { opus_encoder_get_size(channels.as_i32()) };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Initialize a previously allocated encoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `Encoder::size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if `ptr` is null, or a mapped libopus error.
+    pub unsafe fn init_in_place(
+        ptr: *mut OpusEncoder,
+        sample_rate: SampleRate,
+        channels: Channels,
+        application: Application,
+    ) -> Result<()> {
+        if ptr.is_null() {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        let r = unsafe {
+            opus_encoder_init(
+                ptr,
+                sample_rate.as_i32(),
+                channels.as_i32(),
+                application as i32,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
+
     /// Create a new encoder.
     ///
     /// # Errors
@@ -61,15 +136,14 @@ impl Encoder {
             return Err(Error::from_code(error));
         }
 
-        if encoder.is_null() {
-            return Err(Error::AllocFail);
-        }
+        let encoder = NonNull::new(encoder).ok_or(Error::AllocFail)?;
 
-        Ok(Self {
-            raw: encoder,
+        Ok(Self::from_raw(
+            encoder,
             sample_rate,
             channels,
-        })
+            Ownership::Owned,
+        ))
     }
 
     /// Encode 16-bit PCM into an Opus packet.
@@ -78,10 +152,6 @@ impl Encoder {
     /// Returns [`Error::InvalidState`] if the encoder is invalid, [`Error::BadArg`] for
     /// invalid buffer sizes or frame size, or a mapped libopus error.
     pub fn encode(&mut self, input: &[i16], output: &mut [u8]) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         // Validate input buffer size
         if input.is_empty() {
             return Err(Error::BadArg);
@@ -93,8 +163,9 @@ impl Encoder {
         }
 
         let frame_size = input.len() / self.channels.as_usize();
+        let frame_size = NonZeroUsize::new(frame_size).ok_or(Error::BadArg)?;
         // Validate frame size is within Opus limits for the configured sample rate
-        if frame_size == 0 || frame_size > max_frame_samples_for(self.sample_rate) {
+        if frame_size.get() > max_frame_samples_for(self.sample_rate) {
             return Err(Error::BadArg);
         }
 
@@ -106,11 +177,11 @@ impl Encoder {
             return Err(Error::BadArg);
         }
 
-        let frame_size_i32 = i32::try_from(frame_size).map_err(|_| Error::BadArg)?;
+        let frame_size_i32 = i32::try_from(frame_size.get()).map_err(|_| Error::BadArg)?;
         let out_len_i32 = i32::try_from(output.len()).map_err(|_| Error::BadArg)?;
         let result = unsafe {
             opus_encode(
-                self.raw,
+                self.raw.as_ptr(),
                 input.as_ptr(),
                 frame_size_i32,
                 output.as_mut_ptr(),
@@ -139,10 +210,6 @@ impl Encoder {
         output: &mut [u8],
         max_data_bytes: usize,
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         // Validate input buffer size
         if input.is_empty() {
             return Err(Error::BadArg);
@@ -154,8 +221,9 @@ impl Encoder {
         }
 
         let frame_size = input.len() / self.channels.as_usize();
+        let frame_size = NonZeroUsize::new(frame_size).ok_or(Error::BadArg)?;
         // Validate frame size is within Opus limits for the configured sample rate
-        if frame_size == 0 || frame_size > max_frame_samples_for(self.sample_rate) {
+        if frame_size.get() > max_frame_samples_for(self.sample_rate) {
             return Err(Error::BadArg);
         }
 
@@ -171,11 +239,11 @@ impl Encoder {
             return Err(Error::BadArg);
         }
 
-        let frame_size_i32 = i32::try_from(frame_size).map_err(|_| Error::BadArg)?;
+        let frame_size_i32 = i32::try_from(frame_size.get()).map_err(|_| Error::BadArg)?;
         let max_bytes_i32 = i32::try_from(max_data_bytes).map_err(|_| Error::BadArg)?;
         let result = unsafe {
             opus_encode(
-                self.raw,
+                self.raw.as_ptr(),
                 input.as_ptr(),
                 frame_size_i32,
                 output.as_mut_ptr(),
@@ -190,32 +258,12 @@ impl Encoder {
         usize::try_from(result).map_err(|_| Error::InternalError)
     }
 
-    /// Deprecated alias for `encode_limited` (does not itself enable FEC).
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidState`] if the encoder is invalid, [`Error::BadArg`] for
-    /// invalid buffer sizes or frame size, or a mapped libopus error.
-    #[deprecated(
-        note = "Renamed to encode_limited; enabling FEC requires set_inband_fec + set_packet_loss_perc"
-    )]
-    pub fn encode_with_fec(
-        &mut self,
-        input: &[i16],
-        output: &mut [u8],
-        max_data_bytes: usize,
-    ) -> Result<usize> {
-        self.encode_limited(input, output, max_data_bytes)
-    }
-
     /// Encode f32 PCM into an Opus packet.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, [`Error::BadArg`] for
     /// invalid buffer sizes or frame size, or a mapped libopus error.
     pub fn encode_float(&mut self, input: &[f32], output: &mut [u8]) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         if input.is_empty() {
             return Err(Error::BadArg);
         }
@@ -223,17 +271,18 @@ impl Encoder {
             return Err(Error::BadArg);
         }
         let frame_size = input.len() / self.channels.as_usize();
-        if frame_size == 0 || frame_size > max_frame_samples_for(self.sample_rate) {
+        let frame_size = NonZeroUsize::new(frame_size).ok_or(Error::BadArg)?;
+        if frame_size.get() > max_frame_samples_for(self.sample_rate) {
             return Err(Error::BadArg);
         }
         if output.is_empty() || output.len() > i32::MAX as usize {
             return Err(Error::BadArg);
         }
-        let frame_i32 = i32::try_from(frame_size).map_err(|_| Error::BadArg)?;
+        let frame_i32 = i32::try_from(frame_size.get()).map_err(|_| Error::BadArg)?;
         let out_len_i32 = i32::try_from(output.len()).map_err(|_| Error::BadArg)?;
         let n = unsafe {
             opus_encode_float(
-                self.raw,
+                self.raw.as_ptr(),
                 input.as_ptr(),
                 frame_i32,
                 output.as_mut_ptr(),
@@ -387,10 +436,12 @@ impl Encoder {
     /// Query current signal hint.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
+    /// Returns [`Error::InvalidState`] if the encoder is invalid, [`Error::InternalError`] if the
+    /// response is not recognized, or a mapped libopus error.
     pub fn signal(&mut self) -> Result<Signal> {
         let v = self.get_int_ctl(OPUS_GET_SIGNAL_REQUEST as i32)?;
         match v {
+            x if x == OPUS_AUTO => Ok(Signal::Auto),
             x if x == crate::bindings::OPUS_SIGNAL_VOICE as i32 => Ok(Signal::Voice),
             x if x == crate::bindings::OPUS_SIGNAL_MUSIC as i32 => Ok(Signal::Music),
             _ => Err(Error::InternalError),
@@ -410,8 +461,13 @@ impl Encoder {
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn final_range(&mut self) -> Result<u32> {
         let mut val: u32 = 0;
-        let r =
-            unsafe { opus_encoder_ctl(self.raw, OPUS_GET_FINAL_RANGE_REQUEST as i32, &mut val) };
+        let r = unsafe {
+            opus_encoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_GET_FINAL_RANGE_REQUEST as i32,
+                &mut val,
+            )
+        };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -447,21 +503,24 @@ impl Encoder {
     /// Query expert frame duration.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
+    /// Returns [`Error::InvalidState`] if the encoder is invalid, [`Error::InternalError`] if the
+    /// response is not recognized, or a mapped libopus error.
     pub fn expert_frame_duration(&mut self) -> Result<ExpertFrameDuration> {
         let v = self.get_int_ctl(OPUS_GET_EXPERT_FRAME_DURATION_REQUEST as i32)?;
         let vu = u32::try_from(v).map_err(|_| Error::InternalError)?;
-        Ok(match vu {
-            x if x == crate::bindings::OPUS_FRAMESIZE_2_5_MS => ExpertFrameDuration::Ms2_5,
-            x if x == crate::bindings::OPUS_FRAMESIZE_5_MS => ExpertFrameDuration::Ms5,
-            x if x == crate::bindings::OPUS_FRAMESIZE_10_MS => ExpertFrameDuration::Ms10,
-            x if x == crate::bindings::OPUS_FRAMESIZE_20_MS => ExpertFrameDuration::Ms20,
-            x if x == crate::bindings::OPUS_FRAMESIZE_40_MS => ExpertFrameDuration::Ms40,
-            x if x == crate::bindings::OPUS_FRAMESIZE_60_MS => ExpertFrameDuration::Ms60,
-            x if x == crate::bindings::OPUS_FRAMESIZE_80_MS => ExpertFrameDuration::Ms80,
-            x if x == crate::bindings::OPUS_FRAMESIZE_100_MS => ExpertFrameDuration::Ms100,
-            _ => ExpertFrameDuration::Ms120,
-        })
+        match vu {
+            x if x == crate::bindings::OPUS_FRAMESIZE_ARG => Ok(ExpertFrameDuration::Auto),
+            x if x == crate::bindings::OPUS_FRAMESIZE_2_5_MS => Ok(ExpertFrameDuration::Ms2_5),
+            x if x == crate::bindings::OPUS_FRAMESIZE_5_MS => Ok(ExpertFrameDuration::Ms5),
+            x if x == crate::bindings::OPUS_FRAMESIZE_10_MS => Ok(ExpertFrameDuration::Ms10),
+            x if x == crate::bindings::OPUS_FRAMESIZE_20_MS => Ok(ExpertFrameDuration::Ms20),
+            x if x == crate::bindings::OPUS_FRAMESIZE_40_MS => Ok(ExpertFrameDuration::Ms40),
+            x if x == crate::bindings::OPUS_FRAMESIZE_60_MS => Ok(ExpertFrameDuration::Ms60),
+            x if x == crate::bindings::OPUS_FRAMESIZE_80_MS => Ok(ExpertFrameDuration::Ms80),
+            x if x == crate::bindings::OPUS_FRAMESIZE_100_MS => Ok(ExpertFrameDuration::Ms100),
+            x if x == crate::bindings::OPUS_FRAMESIZE_120_MS => Ok(ExpertFrameDuration::Ms120),
+            _ => Err(Error::InternalError),
+        }
     }
 
     /// Disable/enable inter-frame prediction (expert option).
@@ -502,10 +561,7 @@ impl Encoder {
 
     // --- internal helpers ---
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_encoder_ctl(self.raw, req, val) };
+        let r = unsafe { opus_encoder_ctl(self.raw.as_ptr(), req, val) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -515,11 +571,8 @@ impl Encoder {
         Ok(self.get_int_ctl(req)? != 0)
     }
     fn get_int_ctl(&mut self, req: i32) -> Result<i32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v: i32 = 0;
-        let r = unsafe { opus_encoder_ctl(self.raw, req, &mut v) };
+        let r = unsafe { opus_encoder_ctl(self.raw.as_ptr(), req, &mut v) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -543,12 +596,13 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
-        let result =
-            unsafe { opus_encoder_ctl(self.raw, OPUS_SET_BITRATE_REQUEST as i32, bitrate.value()) };
+        let result = unsafe {
+            opus_encoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_SET_BITRATE_REQUEST as i32,
+                bitrate.value(),
+            )
+        };
 
         if result != 0 {
             return Err(Error::from_code(result));
@@ -562,13 +616,14 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn bitrate(&mut self) -> Result<Bitrate> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         let mut bitrate = 0i32;
-        let result =
-            unsafe { opus_encoder_ctl(self.raw, OPUS_GET_BITRATE_REQUEST as i32, &mut bitrate) };
+        let result = unsafe {
+            opus_encoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_GET_BITRATE_REQUEST as i32,
+                &mut bitrate,
+            )
+        };
 
         if result != 0 {
             return Err(Error::from_code(result));
@@ -586,13 +641,9 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn set_complexity(&mut self, complexity: Complexity) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         let result = unsafe {
             opus_encoder_ctl(
-                self.raw,
+                self.raw.as_ptr(),
                 OPUS_SET_COMPLEXITY_REQUEST as i32,
                 complexity.value() as i32,
             )
@@ -610,14 +661,10 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn complexity(&mut self) -> Result<Complexity> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         let mut complexity = 0i32;
         let result = unsafe {
             opus_encoder_ctl(
-                self.raw,
+                self.raw.as_ptr(),
                 OPUS_GET_COMPLEXITY_REQUEST as i32,
                 &mut complexity,
             )
@@ -637,12 +684,9 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn set_vbr(&mut self, enabled: bool) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         let vbr = i32::from(enabled);
-        let result = unsafe { opus_encoder_ctl(self.raw, OPUS_SET_VBR_REQUEST as i32, vbr) };
+        let result =
+            unsafe { opus_encoder_ctl(self.raw.as_ptr(), OPUS_SET_VBR_REQUEST as i32, vbr) };
 
         if result != 0 {
             return Err(Error::from_code(result));
@@ -656,12 +700,9 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn vbr(&mut self) -> Result<bool> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-
         let mut vbr = 0i32;
-        let result = unsafe { opus_encoder_ctl(self.raw, OPUS_GET_VBR_REQUEST as i32, &mut vbr) };
+        let result =
+            unsafe { opus_encoder_ctl(self.raw.as_ptr(), OPUS_GET_VBR_REQUEST as i32, &mut vbr) };
 
         if result != 0 {
             return Err(Error::from_code(result));
@@ -687,10 +728,9 @@ impl Encoder {
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn reset(&mut self) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_encoder_ctl(self.raw, crate::bindings::OPUS_RESET_STATE as i32) };
+        let r = unsafe {
+            opus_encoder_ctl(self.raw.as_ptr(), crate::bindings::OPUS_RESET_STATE as i32)
+        };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -698,10 +738,66 @@ impl Encoder {
     }
 }
 
-impl Drop for Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            opus_encoder_destroy(self.raw);
+impl<'a> EncoderRef<'a> {
+    /// Wrap an externally-initialized encoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`Encoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`Encoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(
+        ptr: *mut OpusEncoder,
+        sample_rate: SampleRate,
+        channels: Channels,
+    ) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        let encoder = Encoder::from_raw(
+            unsafe { NonNull::new_unchecked(ptr) },
+            sample_rate,
+            channels,
+            Ownership::Borrowed,
+        );
+        Self {
+            inner: encoder,
+            _marker: PhantomData,
         }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(
+        buf: &'a mut AlignedBuffer,
+        sample_rate: SampleRate,
+        channels: Channels,
+        application: Application,
+    ) -> Result<Self> {
+        let required = Encoder::size(channels)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusEncoder>();
+        unsafe { Encoder::init_in_place(ptr, sample_rate, channels, application)? };
+        Ok(unsafe { Self::from_raw(ptr, sample_rate, channels) })
+    }
+}
+
+impl Deref for EncoderRef<'_> {
+    type Target = Encoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for EncoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }

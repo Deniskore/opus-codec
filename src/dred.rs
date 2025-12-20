@@ -11,16 +11,35 @@ use crate::constants::max_frame_samples_for;
 use crate::decoder::Decoder;
 use crate::error::{Error, Result};
 use crate::types::SampleRate;
+use crate::{AlignedBuffer, Ownership, RawHandle};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// Managed handle for libopus `OpusDREDDecoder`.
 pub struct DredDecoder {
-    raw: *mut OpusDREDDecoder,
+    raw: RawHandle<OpusDREDDecoder>,
 }
 
 unsafe impl Send for DredDecoder {}
 unsafe impl Sync for DredDecoder {}
 
+/// Borrowed wrapper around an externally allocated DRED decoder.
+pub struct DredDecoderRef<'a> {
+    inner: DredDecoder,
+    _marker: PhantomData<&'a mut OpusDREDDecoder>,
+}
+
+unsafe impl Send for DredDecoderRef<'_> {}
+unsafe impl Sync for DredDecoderRef<'_> {}
+
 impl DredDecoder {
+    fn from_raw(ptr: NonNull<OpusDREDDecoder>, ownership: Ownership) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_dred_decoder_destroy),
+        }
+    }
+
     /// Allocate a new DRED decoder.
     ///
     /// # Errors
@@ -33,10 +52,8 @@ impl DredDecoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if ptr.is_null() {
-            return Err(Error::AllocFail);
-        }
-        Ok(Self { raw: ptr })
+        let ptr = NonNull::new(ptr).ok_or(Error::AllocFail)?;
+        Ok(Self::from_raw(ptr, Ownership::Owned))
     }
 
     /// Initialize an externally allocated decoder buffer.
@@ -48,8 +65,11 @@ impl DredDecoder {
     /// # Errors
     ///
     /// Returns a mapped libopus error if initialization fails.
-    pub unsafe fn init_raw(ptr: *mut OpusDREDDecoder) -> Result<()> {
+    pub unsafe fn init_in_place(ptr: *mut OpusDREDDecoder) -> Result<()> {
         if ptr.is_null() {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
             return Err(Error::BadArg);
         }
         let r = unsafe { opus_dred_decoder_init(ptr) };
@@ -61,7 +81,7 @@ impl DredDecoder {
 
     /// Borrow the raw decoder pointer.
     pub fn as_mut_ptr(&mut self) -> *mut OpusDREDDecoder {
-        self.raw
+        self.raw.as_ptr()
     }
 
     /// Size of a decoder object in bytes.
@@ -86,14 +106,11 @@ impl DredDecoder {
     ///
     /// Returns [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus
     /// error when the control call fails.
-    pub unsafe fn ctl<T>(&mut self, request: i32, arg: T) -> Result<()>
+    pub unsafe fn control<T>(&mut self, request: i32, arg: T) -> Result<()>
     where
         T: Copy,
     {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_dred_decoder_ctl(self.raw, request, arg) };
+        let r = unsafe { opus_dred_decoder_ctl(self.raw.as_ptr(), request, arg) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -115,15 +132,12 @@ impl DredDecoder {
         dred_end: &mut i32,
         defer_processing: bool,
     ) -> Result<usize> {
-        if self.raw.is_null() || state.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
         let max_samples = i32::try_from(max_dred_samples).map_err(|_| Error::BadArg)?;
         let result = unsafe {
             opus_dred_parse(
-                self.raw,
-                state.raw,
+                self.raw.as_ptr(),
+                state.raw.as_ptr(),
                 data.as_ptr(),
                 len,
                 max_samples,
@@ -145,10 +159,7 @@ impl DredDecoder {
     /// Returns [`Error::InvalidState`] if pointers are invalid, or a mapped libopus
     /// error when [`opus_dred_process`] fails.
     pub fn process(&mut self, src: &DredState, dst: &mut DredState) -> Result<()> {
-        if self.raw.is_null() || src.raw.is_null() || dst.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_dred_process(self.raw, src.raw, dst.raw) };
+        let r = unsafe { opus_dred_process(self.raw.as_ptr(), src.raw.as_ptr(), dst.raw.as_ptr()) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -169,15 +180,12 @@ impl DredDecoder {
         dred_offset: i32,
         pcm: &mut [i16],
     ) -> Result<usize> {
-        if self.raw.is_null() || state.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let channel_count = decoder.channels().as_usize();
         let frame_size = validate_pcm_frame_len(pcm, channel_count, decoder.sample_rate())?;
         let result = unsafe {
             opus_decoder_dred_decode(
                 decoder.as_mut_ptr(),
-                state.raw,
+                state.raw.as_ptr(),
                 dred_offset,
                 pcm.as_mut_ptr(),
                 frame_size,
@@ -203,15 +211,12 @@ impl DredDecoder {
         dred_offset: i32,
         pcm: &mut [f32],
     ) -> Result<usize> {
-        if self.raw.is_null() || state.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let channel_count = decoder.channels().as_usize();
         let frame_size = validate_pcm_frame_len(pcm, channel_count, decoder.sample_rate())?;
         let result = unsafe {
             opus_decoder_dred_decode_float(
                 decoder.as_mut_ptr(),
-                state.raw,
+                state.raw.as_ptr(),
                 dred_offset,
                 pcm.as_mut_ptr(),
                 frame_size,
@@ -224,11 +229,53 @@ impl DredDecoder {
     }
 }
 
-impl Drop for DredDecoder {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { opus_dred_decoder_destroy(self.raw) };
+impl<'a> DredDecoderRef<'a> {
+    /// Wrap an externally-initialized DRED decoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`DredDecoder::size()`] bytes
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`DredDecoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(ptr: *mut OpusDREDDecoder) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        let decoder =
+            DredDecoder::from_raw(unsafe { NonNull::new_unchecked(ptr) }, Ownership::Borrowed);
+        Self {
+            inner: decoder,
+            _marker: PhantomData,
         }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(buf: &'a mut AlignedBuffer) -> Result<Self> {
+        let required = DredDecoder::size()?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusDREDDecoder>();
+        unsafe { DredDecoder::init_in_place(ptr)? };
+        Ok(unsafe { Self::from_raw(ptr) })
+    }
+}
+
+impl Deref for DredDecoderRef<'_> {
+    type Target = DredDecoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for DredDecoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -243,7 +290,7 @@ fn validate_pcm_frame_len<T>(
     if pcm.is_empty() {
         return Err(Error::BadArg);
     }
-    if pcm.len() % channel_count != 0 {
+    if !pcm.len().is_multiple_of(channel_count) {
         return Err(Error::BadArg);
     }
     let frame_size_per_ch = pcm.len() / channel_count;
@@ -255,7 +302,7 @@ fn validate_pcm_frame_len<T>(
 
 /// Managed handle for libopus `OpusDRED` state.
 pub struct DredState {
-    raw: *mut OpusDRED,
+    raw: NonNull<OpusDRED>,
 }
 
 unsafe impl Send for DredState {}
@@ -274,40 +321,36 @@ impl DredState {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if ptr.is_null() {
-            return Err(Error::AllocFail);
-        }
+        let ptr = NonNull::new(ptr).ok_or(Error::AllocFail)?;
         Ok(Self { raw: ptr })
     }
 
     /// Size of a DRED state in bytes.
     ///
-    /// # Panics
-    ///
-    /// Panics if libopus reports a negative size, which would indicate a
-    /// mismatch with the bundled headers.
-    /// Size of a DRED state in bytes.
-    ///
     /// # Errors
     ///
-    /// Returns [`Error::InternalError`] if libopus reports an invalid (negative)
-    /// size, indicating a mismatch with the bundled headers.
+    /// Returns [`Error::Unimplemented`] if DRED is disabled in the linked
+    /// libopus, or [`Error::InternalError`] if libopus reports an invalid size.
     pub fn size() -> Result<usize> {
         let raw = unsafe { opus_dred_get_size() };
+        if raw == 0 {
+            return Err(Error::Unimplemented);
+        }
+        if raw < 0 {
+            return Err(Error::InternalError);
+        }
         usize::try_from(raw).map_err(|_| Error::InternalError)
     }
 
     /// Borrow the raw pointer.
     pub fn as_mut_ptr(&mut self) -> *mut OpusDRED {
-        self.raw
+        self.raw.as_ptr()
     }
 }
 
 impl Drop for DredState {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { opus_dred_free(self.raw) };
-        }
+        unsafe { opus_dred_free(self.raw.as_ptr()) };
     }
 }
 

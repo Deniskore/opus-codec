@@ -53,7 +53,7 @@ pub fn packet_channels(packet: &[u8]) -> Result<Channels> {
 ///
 /// # Errors
 /// Returns an error if the packet cannot be parsed.
-pub fn packet_nb_frames(packet: &[u8]) -> Result<usize> {
+pub fn packet_frame_count(packet: &[u8]) -> Result<usize> {
     if packet.is_empty() {
         return Err(Error::BadArg);
     }
@@ -69,7 +69,7 @@ pub fn packet_nb_frames(packet: &[u8]) -> Result<usize> {
 ///
 /// # Errors
 /// Returns an error if the packet cannot be parsed.
-pub fn packet_nb_samples(packet: &[u8], sample_rate: SampleRate) -> Result<usize> {
+pub fn packet_sample_count(packet: &[u8], sample_rate: SampleRate) -> Result<usize> {
     if packet.is_empty() {
         return Err(Error::BadArg);
     }
@@ -186,9 +186,6 @@ pub fn packet_parse(packet: &[u8]) -> Result<(u8, usize, Vec<&[u8]>)> {
     let mut frames = Vec::with_capacity(count);
     for i in 0..count {
         let size = usize::try_from(sizes[i]).map_err(|_| Error::InternalError)?;
-        if size == 0 {
-            continue;
-        }
         let ptr = frames_ptrs[i];
         if ptr.is_null() {
             return Err(Error::InvalidPacket);

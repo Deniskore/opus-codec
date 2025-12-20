@@ -6,7 +6,7 @@ use crate::bindings::{
     OPUS_BANDWIDTH_SUPERWIDEBAND, OPUS_BANDWIDTH_WIDEBAND, OPUS_BITRATE_MAX, OPUS_FRAMESIZE_2_5_MS,
     OPUS_FRAMESIZE_5_MS, OPUS_FRAMESIZE_10_MS, OPUS_FRAMESIZE_20_MS, OPUS_FRAMESIZE_40_MS,
     OPUS_FRAMESIZE_60_MS, OPUS_FRAMESIZE_80_MS, OPUS_FRAMESIZE_100_MS, OPUS_FRAMESIZE_120_MS,
-    OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
+    OPUS_FRAMESIZE_ARG, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
 };
 
 /// Encoder application mode.
@@ -121,6 +121,8 @@ impl FrameSize {
 /// Hint the encoder about the type of content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
+    /// Automatic selection (default).
+    Auto = OPUS_AUTO as isize,
     /// Voice-optimized mode.
     Voice = OPUS_SIGNAL_VOICE as isize,
     /// Music/general audio optimized mode.
@@ -130,6 +132,8 @@ pub enum Signal {
 /// Expert frame duration settings for the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertFrameDuration {
+    /// Select frame size from the argument (default).
+    Auto = OPUS_FRAMESIZE_ARG as isize,
     /// 2.5 ms.
     Ms2_5 = OPUS_FRAMESIZE_2_5_MS as isize,
     /// 5 ms.

@@ -4,18 +4,24 @@ use crate::bindings::{
     OPUS_BITRATE_MAX, OPUS_GET_BITRATE_REQUEST, OPUS_PROJECTION_GET_DEMIXING_MATRIX_GAIN_REQUEST,
     OPUS_PROJECTION_GET_DEMIXING_MATRIX_REQUEST, OPUS_PROJECTION_GET_DEMIXING_MATRIX_SIZE_REQUEST,
     OPUS_SET_BITRATE_REQUEST, OpusProjectionDecoder, OpusProjectionEncoder,
-    opus_projection_ambisonics_encoder_create, opus_projection_decode,
-    opus_projection_decode_float, opus_projection_decoder_create, opus_projection_decoder_destroy,
-    opus_projection_encode, opus_projection_encode_float, opus_projection_encoder_ctl,
-    opus_projection_encoder_destroy,
+    opus_projection_ambisonics_encoder_create, opus_projection_ambisonics_encoder_get_size,
+    opus_projection_ambisonics_encoder_init, opus_projection_decode, opus_projection_decode_float,
+    opus_projection_decoder_create, opus_projection_decoder_destroy,
+    opus_projection_decoder_get_size, opus_projection_decoder_init, opus_projection_encode,
+    opus_projection_encode_float, opus_projection_encoder_ctl, opus_projection_encoder_destroy,
 };
 use crate::constants::max_frame_samples_for;
 use crate::error::{Error, Result};
 use crate::types::{Application, Bitrate, SampleRate};
+use crate::{AlignedBuffer, Ownership, RawHandle};
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// Safe wrapper around `OpusProjectionEncoder`.
 pub struct ProjectionEncoder {
-    raw: *mut OpusProjectionEncoder,
+    raw: RawHandle<OpusProjectionEncoder>,
     sample_rate: SampleRate,
     channels: u8,
     streams: u8,
@@ -25,7 +31,90 @@ pub struct ProjectionEncoder {
 unsafe impl Send for ProjectionEncoder {}
 unsafe impl Sync for ProjectionEncoder {}
 
+/// Borrowed wrapper around a projection encoder state.
+pub struct ProjectionEncoderRef<'a> {
+    inner: ProjectionEncoder,
+    _marker: PhantomData<&'a mut OpusProjectionEncoder>,
+}
+
+unsafe impl Send for ProjectionEncoderRef<'_> {}
+unsafe impl Sync for ProjectionEncoderRef<'_> {}
+
 impl ProjectionEncoder {
+    fn from_raw(
+        ptr: NonNull<OpusProjectionEncoder>,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        ownership: Ownership,
+    ) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_projection_encoder_destroy),
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+        }
+    }
+
+    /// Size in bytes of a projection encoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the channel/mapping configuration is invalid.
+    pub fn size(channels: u8, mapping_family: i32) -> Result<usize> {
+        let raw = unsafe {
+            opus_projection_ambisonics_encoder_get_size(i32::from(channels), mapping_family)
+        };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Initialize a previously allocated projection encoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `ProjectionEncoder::size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] for invalid inputs or a mapped libopus error.
+    pub unsafe fn init_in_place(
+        ptr: *mut OpusProjectionEncoder,
+        sample_rate: SampleRate,
+        channels: u8,
+        mapping_family: i32,
+        application: Application,
+    ) -> Result<(u8, u8)> {
+        if ptr.is_null() || channels == 0 {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        let mut streams = 0i32;
+        let mut coupled = 0i32;
+        let r = unsafe {
+            opus_projection_ambisonics_encoder_init(
+                ptr,
+                sample_rate as i32,
+                i32::from(channels),
+                mapping_family,
+                std::ptr::addr_of_mut!(streams),
+                std::ptr::addr_of_mut!(coupled),
+                application as i32,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok((
+            u8::try_from(streams).map_err(|_| Error::BadArg)?,
+            u8::try_from(coupled).map_err(|_| Error::BadArg)?,
+        ))
+    }
+
     /// Create a new projection encoder using the ambisonics helper.
     ///
     /// Returns [`Error::BadArg`] for unsupported channel/mapping combinations
@@ -57,23 +146,25 @@ impl ProjectionEncoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if enc.is_null() {
-            return Err(Error::AllocFail);
-        }
-        Ok(Self {
-            raw: enc,
+        let enc = NonNull::new(enc).ok_or(Error::AllocFail)?;
+        let streams_u8 = u8::try_from(streams).map_err(|_| Error::BadArg)?;
+        let coupled_u8 = u8::try_from(coupled).map_err(|_| Error::BadArg)?;
+        Ok(Self::from_raw(
+            enc,
             sample_rate,
             channels,
-            streams: u8::try_from(streams).map_err(|_| Error::BadArg)?,
-            coupled_streams: u8::try_from(coupled).map_err(|_| Error::BadArg)?,
-        })
+            streams_u8,
+            coupled_u8,
+            Ownership::Owned,
+        ))
     }
 
     fn validate_frame_size(&self, frame_size_per_ch: usize) -> Result<i32> {
-        if frame_size_per_ch == 0 || frame_size_per_ch > max_frame_samples_for(self.sample_rate) {
+        let frame_size = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size.get() > max_frame_samples_for(self.sample_rate) {
             return Err(Error::BadArg);
         }
-        i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)
+        i32::try_from(frame_size.get()).map_err(|_| Error::BadArg)
     }
 
     fn ensure_pcm_layout(&self, len: usize, frame_size_per_ch: usize) -> Result<()> {
@@ -95,9 +186,6 @@ impl ProjectionEncoder {
         frame_size_per_ch: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         if out.is_empty() || out.len() > i32::MAX as usize {
             return Err(Error::BadArg);
         }
@@ -106,7 +194,7 @@ impl ProjectionEncoder {
         let out_len = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
         let n = unsafe {
             opus_projection_encode(
-                self.raw,
+                self.raw.as_ptr(),
                 pcm.as_ptr(),
                 frame_size,
                 out.as_mut_ptr(),
@@ -131,9 +219,6 @@ impl ProjectionEncoder {
         frame_size_per_ch: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         if out.is_empty() || out.len() > i32::MAX as usize {
             return Err(Error::BadArg);
         }
@@ -142,7 +227,7 @@ impl ProjectionEncoder {
         let out_len = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
         let n = unsafe {
             opus_projection_encode_float(
-                self.raw,
+                self.raw.as_ptr(),
                 pcm.as_ptr(),
                 frame_size,
                 out.as_mut_ptr(),
@@ -209,7 +294,7 @@ impl ProjectionEncoder {
         }
         let r = unsafe {
             opus_projection_encoder_ctl(
-                self.raw,
+                self.raw.as_ptr(),
                 OPUS_PROJECTION_GET_DEMIXING_MATRIX_REQUEST as i32,
                 out.as_mut_ptr(),
                 size,
@@ -259,10 +344,7 @@ impl ProjectionEncoder {
     }
 
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
-        let r = unsafe { opus_projection_encoder_ctl(self.raw, req, val) };
+        let r = unsafe { opus_projection_encoder_ctl(self.raw.as_ptr(), req, val) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -270,11 +352,8 @@ impl ProjectionEncoder {
     }
 
     fn get_int_ctl(&mut self, req: i32) -> Result<i32> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         let mut v = 0i32;
-        let r = unsafe { opus_projection_encoder_ctl(self.raw, req, &mut v) };
+        let r = unsafe { opus_projection_encoder_ctl(self.raw.as_ptr(), req, &mut v) };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -282,17 +361,86 @@ impl ProjectionEncoder {
     }
 }
 
-impl Drop for ProjectionEncoder {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { opus_projection_encoder_destroy(self.raw) };
+impl<'a> ProjectionEncoderRef<'a> {
+    /// Wrap an externally-initialized projection encoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`ProjectionEncoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`ProjectionEncoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(
+        ptr: *mut OpusProjectionEncoder,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+    ) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        let encoder = ProjectionEncoder::from_raw(
+            unsafe { NonNull::new_unchecked(ptr) },
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+            Ownership::Borrowed,
+        );
+        Self {
+            inner: encoder,
+            _marker: PhantomData,
         }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(
+        buf: &'a mut AlignedBuffer,
+        sample_rate: SampleRate,
+        channels: u8,
+        mapping_family: i32,
+        application: Application,
+    ) -> Result<Self> {
+        let required = ProjectionEncoder::size(channels, mapping_family)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusProjectionEncoder>();
+        let (streams, coupled) = unsafe {
+            ProjectionEncoder::init_in_place(
+                ptr,
+                sample_rate,
+                channels,
+                mapping_family,
+                application,
+            )?
+        };
+        Ok(unsafe { Self::from_raw(ptr, sample_rate, channels, streams, coupled) })
+    }
+}
+
+impl Deref for ProjectionEncoderRef<'_> {
+    type Target = ProjectionEncoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for ProjectionEncoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
 /// Safe wrapper around `OpusProjectionDecoder`.
 pub struct ProjectionDecoder {
-    raw: *mut OpusProjectionDecoder,
+    raw: RawHandle<OpusProjectionDecoder>,
     sample_rate: SampleRate,
     channels: u8,
     streams: u8,
@@ -302,7 +450,91 @@ pub struct ProjectionDecoder {
 unsafe impl Send for ProjectionDecoder {}
 unsafe impl Sync for ProjectionDecoder {}
 
+/// Borrowed wrapper around a projection decoder state.
+pub struct ProjectionDecoderRef<'a> {
+    inner: ProjectionDecoder,
+    _marker: PhantomData<&'a mut OpusProjectionDecoder>,
+}
+
+unsafe impl Send for ProjectionDecoderRef<'_> {}
+unsafe impl Sync for ProjectionDecoderRef<'_> {}
+
 impl ProjectionDecoder {
+    fn from_raw(
+        ptr: NonNull<OpusProjectionDecoder>,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        ownership: Ownership,
+    ) -> Self {
+        Self {
+            raw: RawHandle::new(ptr, ownership, opus_projection_decoder_destroy),
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+        }
+    }
+
+    /// Size in bytes of a projection decoder state for external allocation.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the channel/stream configuration is invalid.
+    pub fn size(channels: u8, streams: u8, coupled_streams: u8) -> Result<usize> {
+        let raw = unsafe {
+            opus_projection_decoder_get_size(
+                i32::from(channels),
+                i32::from(streams),
+                i32::from(coupled_streams),
+            )
+        };
+        if raw <= 0 {
+            return Err(Error::BadArg);
+        }
+        usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Initialize a previously allocated projection decoder state.
+    ///
+    /// # Safety
+    /// The caller must provide a valid pointer to `ProjectionDecoder::size()` bytes,
+    /// aligned to at least `align_of::<usize>()` (malloc-style alignment).
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] for invalid inputs or a mapped libopus error.
+    pub unsafe fn init_in_place(
+        ptr: *mut OpusProjectionDecoder,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        demixing_matrix: &[u8],
+    ) -> Result<()> {
+        if ptr.is_null() || demixing_matrix.is_empty() {
+            return Err(Error::BadArg);
+        }
+        if !crate::opus_ptr_is_aligned(ptr.cast()) {
+            return Err(Error::BadArg);
+        }
+        let matrix_len = i32::try_from(demixing_matrix.len()).map_err(|_| Error::BadArg)?;
+        let r = unsafe {
+            opus_projection_decoder_init(
+                ptr,
+                sample_rate as i32,
+                i32::from(channels),
+                i32::from(streams),
+                i32::from(coupled_streams),
+                demixing_matrix.as_ptr().cast_mut(),
+                matrix_len,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
+
     /// Create a projection decoder given the demixing matrix provided by the encoder.
     ///
     /// # Errors
@@ -334,23 +566,23 @@ impl ProjectionDecoder {
         if err != 0 {
             return Err(Error::from_code(err));
         }
-        if dec.is_null() {
-            return Err(Error::AllocFail);
-        }
-        Ok(Self {
-            raw: dec,
+        let dec = NonNull::new(dec).ok_or(Error::AllocFail)?;
+        Ok(Self::from_raw(
+            dec,
             sample_rate,
             channels,
             streams,
             coupled_streams,
-        })
+            Ownership::Owned,
+        ))
     }
 
     fn validate_frame_size(&self, frame_size_per_ch: usize) -> Result<i32> {
-        if frame_size_per_ch == 0 || frame_size_per_ch > max_frame_samples_for(self.sample_rate) {
+        let frame_size = NonZeroUsize::new(frame_size_per_ch).ok_or(Error::BadArg)?;
+        if frame_size.get() > max_frame_samples_for(self.sample_rate) {
             return Err(Error::BadArg);
         }
-        i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)
+        i32::try_from(frame_size.get()).map_err(|_| Error::BadArg)
     }
 
     fn ensure_output_layout(&self, len: usize, frame_size_per_ch: usize) -> Result<()> {
@@ -373,9 +605,6 @@ impl ProjectionDecoder {
         frame_size_per_ch: usize,
         fec: bool,
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         self.ensure_output_layout(out.len(), frame_size_per_ch)?;
         let frame_size = self.validate_frame_size(frame_size_per_ch)?;
         let packet_len = if packet.is_empty() {
@@ -385,7 +614,7 @@ impl ProjectionDecoder {
         };
         let n = unsafe {
             opus_projection_decode(
-                self.raw,
+                self.raw.as_ptr(),
                 if packet.is_empty() {
                     std::ptr::null()
                 } else {
@@ -416,9 +645,6 @@ impl ProjectionDecoder {
         frame_size_per_ch: usize,
         fec: bool,
     ) -> Result<usize> {
-        if self.raw.is_null() {
-            return Err(Error::InvalidState);
-        }
         self.ensure_output_layout(out.len(), frame_size_per_ch)?;
         let frame_size = self.validate_frame_size(frame_size_per_ch)?;
         let packet_len = if packet.is_empty() {
@@ -428,7 +654,7 @@ impl ProjectionDecoder {
         };
         let n = unsafe {
             opus_projection_decode_float(
-                self.raw,
+                self.raw.as_ptr(),
                 if packet.is_empty() {
                     std::ptr::null()
                 } else {
@@ -471,10 +697,81 @@ impl ProjectionDecoder {
     }
 }
 
-impl Drop for ProjectionDecoder {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { opus_projection_decoder_destroy(self.raw) };
+impl<'a> ProjectionDecoderRef<'a> {
+    /// Wrap an externally-initialized projection decoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`ProjectionDecoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Use [`ProjectionDecoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(
+        ptr: *mut OpusProjectionDecoder,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+    ) -> Self {
+        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
+        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        let decoder = ProjectionDecoder::from_raw(
+            unsafe { NonNull::new_unchecked(ptr) },
+            sample_rate,
+            channels,
+            streams,
+            coupled_streams,
+            Ownership::Borrowed,
+        );
+        Self {
+            inner: decoder,
+            _marker: PhantomData,
         }
+    }
+
+    /// Initialize and wrap an externally allocated buffer.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the buffer is too small, or a mapped libopus error.
+    pub fn init_in(
+        buf: &'a mut AlignedBuffer,
+        sample_rate: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        demixing_matrix: &[u8],
+    ) -> Result<Self> {
+        let required = ProjectionDecoder::size(channels, streams, coupled_streams)?;
+        if buf.capacity_bytes() < required {
+            return Err(Error::BadArg);
+        }
+        let ptr = buf.as_mut_ptr::<OpusProjectionDecoder>();
+        unsafe {
+            ProjectionDecoder::init_in_place(
+                ptr,
+                sample_rate,
+                channels,
+                streams,
+                coupled_streams,
+                demixing_matrix,
+            )?;
+        }
+        Ok(unsafe { Self::from_raw(ptr, sample_rate, channels, streams, coupled_streams) })
+    }
+}
+
+impl Deref for ProjectionDecoderRef<'_> {
+    type Target = ProjectionDecoder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for ProjectionDecoderRef<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
