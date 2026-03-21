@@ -19,6 +19,7 @@ struct BuildOptions {
     presume_avx: bool,
     target_arch: String,
     avx_allowed: bool,
+    msvc_static_crt: bool,
 }
 
 impl BuildOptions {
@@ -28,6 +29,9 @@ impl BuildOptions {
         let presume_avx = env::var("CARGO_FEATURE_PRESUME_AVX2").is_ok();
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let avx_allowed = presume_avx && matches!(target_arch.as_str(), "x86" | "x86_64");
+        let msvc_static_crt = is_windows_msvc_target()
+            && env::var("CARGO_CFG_TARGET_FEATURE")
+                .is_ok_and(|features| features.split(',').any(|feature| feature == "crt-static"));
 
         Self {
             use_system_lib,
@@ -35,6 +39,7 @@ impl BuildOptions {
             presume_avx,
             target_arch,
             avx_allowed,
+            msvc_static_crt,
         }
     }
 }
@@ -49,6 +54,9 @@ fn emit_rerun_directives() {
     println!("cargo:rerun-if-changed=opus/dnn/download_model.sh");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_LIB");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PRESUME_AVX2");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FAMILY");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
 }
 
 fn handle_system_lib(opts: &BuildOptions) {
@@ -76,31 +84,30 @@ fn build_bundled_and_link(opts: &BuildOptions) {
         );
     }
 
-    let dst = build_bundled(opts.dred_enabled, opts.avx_allowed);
+    let dst = build_bundled(opts.dred_enabled, opts.avx_allowed, opts.msvc_static_crt);
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=opus");
 }
 
-fn build_bundled(dred_enabled: bool, presume_avx: bool) -> std::path::PathBuf {
+fn build_bundled(
+    dred_enabled: bool,
+    presume_avx: bool,
+    msvc_static_crt: bool,
+) -> std::path::PathBuf {
     let mut config = cmake::Config::new("opus");
 
     config.profile("Release");
-
-    if should_use_msvc_crt_flag() {
-        let profile = env::var("PROFILE").unwrap_or_default();
-        let crt_flag = if profile.eq_ignore_ascii_case("debug") {
-            "/MDd"
-        } else {
-            "/MD"
-        };
-        config.cflag(crt_flag);
-    }
+    config.static_crt(msvc_static_crt);
 
     config
         .define("OPUS_BUILD_SHARED_LIBRARY", "OFF")
         .define("OPUS_BUILD_TESTING", "OFF")
         .define("OPUS_BUILD_PROGRAMS", "OFF")
         .define("OPUS_DRED", if dred_enabled { "ON" } else { "OFF" })
+        .define(
+            "OPUS_STATIC_RUNTIME",
+            if msvc_static_crt { "ON" } else { "OFF" },
+        )
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("OPUS_DISABLE_INTRINSICS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
@@ -146,7 +153,7 @@ fn generate_bindings() {
         .expect("Couldn't write bindings!");
 }
 
-fn should_use_msvc_crt_flag() -> bool {
+fn is_windows_msvc_target() -> bool {
     matches!(
         env::var("CARGO_CFG_TARGET_FAMILY").as_deref(),
         Ok("windows")
