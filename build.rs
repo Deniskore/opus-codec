@@ -78,6 +78,7 @@ fn build_bundled_and_link(opts: &BuildOptions) {
 
     let dst = build_bundled(opts.dred_enabled, opts.avx_allowed);
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
+    println!("cargo:rustc-link-search=native={}/lib64", dst.display());
     println!("cargo:rustc-link-lib=static=opus");
 }
 
