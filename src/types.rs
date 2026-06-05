@@ -159,6 +159,16 @@ pub enum ExpertFrameDuration {
 pub struct Complexity(u32);
 
 impl Complexity {
+    /// Create a complexity value when `complexity` is in the range 0..=10.
+    #[must_use]
+    pub const fn try_new(complexity: u32) -> Option<Self> {
+        if complexity <= 10 {
+            Some(Self(complexity))
+        } else {
+            None
+        }
+    }
+
     /// Create a new complexity value in range 0..=10.
     ///
     /// # Panics
@@ -214,5 +224,12 @@ mod tests {
         assert_eq!(FrameSize::Ms20.samples(SampleRate::Hz48000), 960);
         assert_eq!(FrameSize::Ms5.samples(SampleRate::Hz16000), 80);
         assert_eq!(FrameSize::Ms2_5.samples(SampleRate::Hz8000), 20);
+    }
+
+    #[test]
+    fn complexity_checked_constructor_rejects_out_of_range_values() {
+        assert_eq!(Complexity::try_new(0), Some(Complexity::new(0)));
+        assert_eq!(Complexity::try_new(10), Some(Complexity::new(10)));
+        assert_eq!(Complexity::try_new(11), None);
     }
 }

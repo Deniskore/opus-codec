@@ -45,6 +45,17 @@ fn test_projection_ambisonics() {
 }
 
 #[test]
+fn test_projection_size_helpers_reject_invalid_args() {
+    assert_eq!(ProjectionEncoder::size(0, 3), Err(Error::BadArg));
+    assert_eq!(ProjectionEncoder::size(4, 1), Err(Error::BadArg));
+
+    assert_eq!(ProjectionDecoder::size(0, 1, 0), Err(Error::BadArg));
+    assert_eq!(ProjectionDecoder::size(4, 0, 0), Err(Error::BadArg));
+    assert_eq!(ProjectionDecoder::size(4, 1, 2), Err(Error::BadArg));
+    assert_eq!(ProjectionDecoder::size(255, 255, 1), Err(Error::BadArg));
+}
+
+#[test]
 fn test_init_in_place_unowned_projection() {
     let sr = SampleRate::Hz48000;
     let channels = 4;

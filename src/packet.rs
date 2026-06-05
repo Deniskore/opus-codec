@@ -2,17 +2,30 @@
 
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_possible_wrap)]
+#![cfg_attr(not(opus_codec_rust_packet_ops), allow(dead_code))]
 
 use crate::bindings::{
     OPUS_BANDWIDTH_FULLBAND, OPUS_BANDWIDTH_MEDIUMBAND, OPUS_BANDWIDTH_NARROWBAND,
-    OPUS_BANDWIDTH_SUPERWIDEBAND, OPUS_BANDWIDTH_WIDEBAND, opus_multistream_packet_pad,
-    opus_multistream_packet_unpad, opus_packet_get_bandwidth, opus_packet_get_nb_channels,
-    opus_packet_get_nb_frames, opus_packet_get_nb_samples, opus_packet_get_samples_per_frame,
-    opus_packet_has_lbrr, opus_packet_pad, opus_packet_parse, opus_packet_unpad,
-    opus_pcm_soft_clip,
+    OPUS_BANDWIDTH_SUPERWIDEBAND, OPUS_BANDWIDTH_WIDEBAND, opus_multistream_packet_unpad,
+    opus_packet_get_bandwidth, opus_packet_get_nb_channels, opus_packet_get_nb_frames,
+    opus_packet_get_nb_samples, opus_packet_get_samples_per_frame, opus_packet_has_lbrr,
+    opus_packet_parse, opus_packet_unpad, opus_pcm_soft_clip,
 };
+#[cfg(not(opus_codec_rust_packet_ops))]
+use crate::bindings::{opus_multistream_packet_pad, opus_packet_pad};
 use crate::error::{Error, Result};
 use crate::types::{Bandwidth, Channels, SampleRate};
+
+mod layout;
+
+pub(crate) use layout::MAX_FRAMES_PER_PACKET;
+#[cfg(opus_codec_rust_packet_ops)]
+pub(crate) use layout::{
+    PacketPadding, PacketRepacketizerLayout, packet_repacketizer_layout, repacketize_frames,
+    repacketize_frames_range,
+};
+#[cfg(opus_codec_rust_packet_ops)]
+use layout::{multistream_last_stream_offset, pad_single_packet};
 
 /// Get bandwidth from a packet.
 ///
@@ -154,20 +167,27 @@ pub fn soft_clip(
     Ok(())
 }
 
-/// Parse packet into frame pointers and sizes. Returns (toc, `payload_offset`, `frame_sizes`).
-/// Note: Returned frame slices borrow from `packet` and are valid as long as `packet` lives.
+/// Parse a packet into caller-provided frame storage.
+///
+/// Returns `(toc, payload_offset, frame_count)`. The first `frame_count`
+/// entries in `frames` are replaced with slices that borrow from `packet`.
 ///
 /// # Errors
-/// Returns an error if the packet cannot be parsed.
-pub fn packet_parse(packet: &[u8]) -> Result<(u8, usize, Vec<&[u8]>)> {
+/// Returns [`Error::BufferTooSmall`] if `frames` cannot hold every parsed
+/// frame, or another error if the packet cannot be parsed.
+pub fn packet_parse_into<'packet>(
+    packet: &'packet [u8],
+    frames: &mut [&'packet [u8]],
+) -> Result<(u8, usize, usize)> {
     if packet.is_empty() {
         return Err(Error::BadArg);
     }
     let mut out_toc: u8 = 0;
     let mut payload_offset: i32 = 0;
-    // libopus caps frames at 48 according to docs
-    let mut frames_ptrs: [*const u8; 48] = [std::ptr::null(); 48];
-    let mut sizes: [i16; 48] = [0; 48];
+    // libopus caps frames at MAX_FRAMES_PER_PACKET according to docs.
+    let mut frames_ptrs: [*const u8; MAX_FRAMES_PER_PACKET] =
+        [std::ptr::null(); MAX_FRAMES_PER_PACKET];
+    let mut sizes: [i16; MAX_FRAMES_PER_PACKET] = [0; MAX_FRAMES_PER_PACKET];
     let len_i32 = i32::try_from(packet.len()).map_err(|_| Error::BadArg)?;
     let n = unsafe {
         opus_packet_parse(
@@ -183,7 +203,11 @@ pub fn packet_parse(packet: &[u8]) -> Result<(u8, usize, Vec<&[u8]>)> {
         return Err(Error::from_code(n));
     }
     let count = usize::try_from(n).map_err(|_| Error::InternalError)?;
-    let mut frames = Vec::with_capacity(count);
+    if count > frames.len() {
+        return Err(Error::BufferTooSmall);
+    }
+    let mut starts = [0usize; MAX_FRAMES_PER_PACKET];
+    let mut lengths = [0usize; MAX_FRAMES_PER_PACKET];
     for i in 0..count {
         let size = usize::try_from(sizes[i]).map_err(|_| Error::InternalError)?;
         let ptr = frames_ptrs[i];
@@ -197,25 +221,65 @@ pub fn packet_parse(packet: &[u8]) -> Result<(u8, usize, Vec<&[u8]>)> {
         }
         // SAFETY: pointers are into `packet`; derive offset via pointer arithmetic
         let start = ptr_addr - base_addr;
-        let end = start + size;
+        let end = start.checked_add(size).ok_or(Error::InternalError)?;
         if end > packet.len() {
             return Err(Error::InvalidPacket);
         }
-        frames.push(&packet[start..end]);
+        starts[i] = start;
+        lengths[i] = size;
+    }
+    for i in 0..count {
+        frames[i] = &packet[starts[i]..starts[i] + lengths[i]];
     }
     Ok((
         out_toc,
         usize::try_from(payload_offset).map_err(|_| Error::InternalError)?,
-        frames,
+        count,
     ))
+}
+
+/// Parse packet into frame slices. Returns `(toc, payload_offset, frames)`.
+///
+/// Returned frame slices borrow from `packet` and are valid as long as
+/// `packet` lives. Use [`packet_parse_into`] to supply reusable storage and
+/// avoid allocating the returned vector.
+///
+/// # Errors
+/// Returns an error if the packet cannot be parsed.
+pub fn packet_parse(packet: &[u8]) -> Result<(u8, usize, Vec<&[u8]>)> {
+    let mut frames = [&[][..]; MAX_FRAMES_PER_PACKET];
+    let (toc, payload_offset, frame_count) = packet_parse_into(packet, &mut frames)?;
+    Ok((toc, payload_offset, frames[..frame_count].to_vec()))
+}
+
+/// Increase a packet's size by adding padding to reach `new_len`.
+///
+/// # Errors
+/// Returns [`Error::BadArg`] for invalid lengths or another error if padding fails.
+#[cfg(opus_codec_rust_packet_ops)]
+pub fn packet_pad(packet: &mut [u8], len: usize, new_len: usize) -> Result<()> {
+    if new_len < len || new_len > packet.len() {
+        return Err(Error::BadArg);
+    }
+    if len == 0 {
+        return Err(Error::BadArg);
+    }
+    if len == new_len {
+        return Ok(());
+    }
+    pad_single_packet(packet, len, new_len)
 }
 
 /// Increase a packet's size by adding padding to reach `new_len`.
 ///
 /// # Errors
 /// Returns [`Error::BadArg`] for invalid lengths or a mapped libopus error if padding fails.
+#[cfg(not(opus_codec_rust_packet_ops))]
 pub fn packet_pad(packet: &mut [u8], len: usize, new_len: usize) -> Result<()> {
     if new_len < len || new_len > packet.len() {
+        return Err(Error::BadArg);
+    }
+    if len == 0 {
         return Err(Error::BadArg);
     }
     let len_i32 = i32::try_from(len).map_err(|_| Error::BadArg)?;
@@ -235,6 +299,9 @@ pub fn packet_unpad(packet: &mut [u8], len: usize) -> Result<usize> {
     if len > packet.len() {
         return Err(Error::BadArg);
     }
+    if len == 0 {
+        return Err(Error::BadArg);
+    }
     let len_i32 = i32::try_from(len).map_err(|_| Error::BadArg)?;
     let n = unsafe { opus_packet_unpad(packet.as_mut_ptr(), len_i32) };
     if n < 0 {
@@ -246,7 +313,8 @@ pub fn packet_unpad(packet: &mut [u8], len: usize) -> Result<usize> {
 /// Pad a multistream packet to `new_len` given `nb_streams`.
 ///
 /// # Errors
-/// Returns [`Error::BadArg`] for invalid lengths or a mapped libopus error if padding fails.
+/// Returns [`Error::BadArg`] for invalid lengths or another error if padding fails.
+#[cfg(opus_codec_rust_packet_ops)]
 pub fn multistream_packet_pad(
     packet: &mut [u8],
     len: usize,
@@ -254,6 +322,48 @@ pub fn multistream_packet_pad(
     nb_streams: i32,
 ) -> Result<()> {
     if new_len < len || new_len > packet.len() {
+        return Err(Error::BadArg);
+    }
+    if len == 0 {
+        return Err(Error::BadArg);
+    }
+    // The public API requires at least one stream. Reject invalid counts
+    // before delegating to libopus' multistream packet walker.
+    if nb_streams < 1 {
+        return Err(Error::BadArg);
+    }
+    if len == new_len {
+        return Ok(());
+    }
+    let nb_streams = usize::try_from(nb_streams).map_err(|_| Error::BadArg)?;
+    let last_stream_offset = multistream_last_stream_offset(&packet[..len], nb_streams)?;
+    if last_stream_offset == len {
+        return Err(Error::BadArg);
+    }
+    let amount = new_len - len;
+    let last_len = len - last_stream_offset;
+    let last_new_len = last_len.checked_add(amount).ok_or(Error::BadArg)?;
+    pad_single_packet(&mut packet[last_stream_offset..], last_len, last_new_len)
+}
+
+/// Pad a multistream packet to `new_len` given `nb_streams`.
+///
+/// # Errors
+/// Returns [`Error::BadArg`] for invalid lengths or a mapped libopus error if padding fails.
+#[cfg(not(opus_codec_rust_packet_ops))]
+pub fn multistream_packet_pad(
+    packet: &mut [u8],
+    len: usize,
+    new_len: usize,
+    nb_streams: i32,
+) -> Result<()> {
+    if new_len < len || new_len > packet.len() {
+        return Err(Error::BadArg);
+    }
+    if len == 0 {
+        return Err(Error::BadArg);
+    }
+    if nb_streams < 1 {
         return Err(Error::BadArg);
     }
     let len_i32 = i32::try_from(len).map_err(|_| Error::BadArg)?;
@@ -273,6 +383,14 @@ pub fn multistream_packet_pad(
 /// Returns [`Error::BadArg`] for invalid lengths or a mapped libopus error if unpadding fails.
 pub fn multistream_packet_unpad(packet: &mut [u8], len: usize, nb_streams: i32) -> Result<usize> {
     if len > packet.len() {
+        return Err(Error::BadArg);
+    }
+    if len == 0 {
+        return Err(Error::BadArg);
+    }
+    // The public API requires at least one stream. Reject invalid counts
+    // before delegating to libopus' multistream packet walker.
+    if nb_streams < 1 {
         return Err(Error::BadArg);
     }
     let len_i32 = i32::try_from(len).map_err(|_| Error::BadArg)?;

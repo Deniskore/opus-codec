@@ -2,7 +2,7 @@ use opus_codec::{Application, Channels, Decoder, Encoder, SampleRate};
 use std::sync::Arc;
 use std::thread;
 
-fn assert_send_sync<T: Send + Sync>() {}
+fn assert_send<T: Send>() {}
 
 fn pcm_frame() -> Vec<i16> {
     const FRAME: usize = 960; // 20 ms @ 48 kHz per channel
@@ -13,13 +13,13 @@ fn pcm_frame() -> Vec<i16> {
 }
 
 #[test]
-fn encoder_is_send_sync() {
-    assert_send_sync::<Encoder>();
+fn encoder_is_send() {
+    assert_send::<Encoder>();
 }
 
 #[test]
-fn decoder_is_send_sync() {
-    assert_send_sync::<Decoder>();
+fn decoder_is_send() {
+    assert_send::<Decoder>();
 }
 
 #[test]

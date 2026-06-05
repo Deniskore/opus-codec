@@ -31,3 +31,9 @@ at your option.
 
 The upstream libopus sources are vendored via `git subtree` at tag **v1.5.2** (split commit `ddbe48383984d56acd9e1ab6a090c54ca6b735a6`).
 You can verify the copy is pristine by diffing `opus/` against that upstream commit.
+
+## Windows MSVC
+
+Bundled builds follow Cargo's selected C runtime automatically. By default, `opus-codec` builds the vendored `libopus` with the dynamic MSVC runtime. If you build with `RUSTFLAGS="-C target-feature=+crt-static"`, the bundled `libopus` build switches to the static MSVC runtime as well.
+
+If you enable the `system-lib` feature, `opus-codec` links against an already installed `libopus` instead of the vendored copy. In that case, the installed `libopus` must use the same CRT mode as the final binary.

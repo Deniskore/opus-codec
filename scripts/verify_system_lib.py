@@ -2,118 +2,72 @@
 """
 Verify system libopus usage:
 
-- Ensures pkg-config reports libopus 1.5.2.
-- Builds and tests with the `system-lib` feature.
+- Requires pkg-config to find libopus 1.5.2 or newer.
+- Verifies Cargo selected the system-lib build-script path rather than CMake.
+- Builds and tests every Rust target with the `system-lib` feature.
 """
 
-import subprocess
+import os
 from pathlib import Path
-from typing import Optional
 
 import ci_utils
 
-DEB_URLS = {
-    "dev": [
-        "https://deb.debian.org/debian/pool/main/o/opus/libopus-dev_1.5.2-2_amd64.deb",
-        "https://mirrors.edge.kernel.org/debian/pool/main/o/opus/libopus-dev_1.5.2-2_amd64.deb",
-    ],
-    "runtime": [
-        "https://deb.debian.org/debian/pool/main/o/opus/libopus0_1.5.2-2_amd64.deb",
-        "https://mirrors.edge.kernel.org/debian/pool/main/o/opus/libopus0_1.5.2-2_amd64.deb",
-    ],
-}
-
-EXPECTED_VERSION = "1.5.2"
+MINIMUM_VERSION = "1.5.2"
+TARGET_DIR = os.environ.get("CARGO_TARGET_DIR", "target/ci-system-lib")
 
 
-def pkg_config_version() -> Optional[str]:
-    try:
-        out = ci_utils.run(
-            ["pkg-config", "--modversion", "opus"], capture_output=True
-        ).stdout
-        return out.strip()
-    except subprocess.CalledProcessError as exc:
-        print(f"pkg-config failed: {exc}")
-        return None
+def verify_pkg_config() -> str:
+    ci_utils.run(
+        ["pkg-config", "--print-errors", f"--atleast-version={MINIMUM_VERSION}", "opus"],
+        capture_output=True,
+    )
+    version = ci_utils.run(
+        ["pkg-config", "--modversion", "opus"], capture_output=True
+    ).stdout.strip()
+    print(f"pkg-config opus version: {version}")
+    return version
 
 
-def download_first(urls, dest: Path) -> bool:
-    for u in urls:
-        try:
-            ci_utils.run(["curl", "-fLsS", u, "-o", str(dest)])
-            print(f"Downloaded {u}")
-            return True
-        except subprocess.CalledProcessError:
-            print(f"Download failed from {u}, trying next mirror...")
-    return False
+def verify_system_build() -> None:
+    env = {"CARGO_TARGET_DIR": TARGET_DIR}
+    result = ci_utils.run(
+        [
+            "cargo",
+            "test",
+            "--no-run",
+            "--all-targets",
+            "--features",
+            "system-lib",
+            "--message-format=json-render-diagnostics",
+        ],
+        env=env,
+        capture_output=True,
+    )
+    message = ci_utils.cargo_root_build_script(result.stdout)
+    cfgs = set(message.get("cfgs", []))
+    linked_libs = set(message.get("linked_libs", []))
+    linked_names = {lib.split("=", 1)[-1] for lib in linked_libs}
+    linked_paths = [str(path) for path in message.get("linked_paths", [])]
+    out_dir = Path(message["out_dir"])
 
+    if "opus_codec_system_lib" not in cfgs:
+        ci_utils.fail("Cargo build script did not emit opus_codec_system_lib")
+    if "opus" not in linked_names:
+        ci_utils.fail(f"Unexpected system-lib link directives: {sorted(linked_libs)}")
+    if any(str(out_dir) in path for path in linked_paths):
+        ci_utils.fail(f"System-lib build linked a bundled OUT_DIR path: {linked_paths}")
+    if (out_dir / "build" / "CMakeCache.txt").exists():
+        ci_utils.fail(f"System-lib build unexpectedly configured bundled CMake in {out_dir}")
 
-def install_debs_if_needed() -> None:
-    ver = pkg_config_version()
-    if ver == EXPECTED_VERSION:
-        print(f"libopus already at {EXPECTED_VERSION}")
-        return
-
-    # Fast path: try the packaged version first.
-    with ci_utils.group("Install libopus-dev from apt"):
-        try:
-            ci_utils.run(["sudo", "apt-get", "update"])
-            ci_utils.run(["sudo", "apt-get", "install", "-y", "libopus-dev"])
-        except subprocess.CalledProcessError:
-            print("apt-get install libopus-dev failed, will try deb mirrors")
-
-    ver_after_apt = pkg_config_version()
-    if ver_after_apt == EXPECTED_VERSION:
-        print(f"libopus at {EXPECTED_VERSION} after apt install")
-        return
-
-    # Try downloading Debian packages on Ubuntu runners.
-    # Only proceed if /etc/os-release indicates Ubuntu.
-    os_release = Path("/etc/os-release")
-    if os_release.exists():
-        data = os_release.read_text().lower()
-        if "ubuntu" not in data:
-            ci_utils.fail(
-                f"Expected libopus {EXPECTED_VERSION} but found {ver_after_apt}; not on Ubuntu, aborting"
-            )
-    else:
-        ci_utils.fail(
-            f"Expected libopus {EXPECTED_VERSION} but found {ver_after_apt}; /etc/os-release missing"
-        )
-
-    runtime_deb = Path("/tmp/libopus0.deb")
-    dev_deb = Path("/tmp/libopus-dev.deb")
-
-    with ci_utils.group("Download libopus debs"):
-        ok = download_first(DEB_URLS["runtime"], runtime_deb) and download_first(
-            DEB_URLS["dev"], dev_deb
-        )
-        if not ok:
-            ci_utils.fail("Failed to download libopus debs from all mirrors")
-
-    with ci_utils.group("Install libopus debs"):
-        try:
-            ci_utils.run(["sudo", "dpkg", "-i", str(runtime_deb), str(dev_deb)])
-        except subprocess.CalledProcessError:
-            print("dpkg failed, trying apt-get install -f")
-            ci_utils.run(["sudo", "apt-get", "install", "-f", "-y"])
-
-    ver_after = pkg_config_version()
-    if ver_after != EXPECTED_VERSION:
-        ci_utils.fail(
-            f"After deb install, expected libopus {EXPECTED_VERSION} but found {ver_after}"
-        )
+    print(f"Verified system-lib build-script path in {out_dir}")
+    ci_utils.run(
+        ["cargo", "test", "--all-targets", "--features", "system-lib"], env=env
+    )
 
 
 def main() -> None:
-    install_debs_if_needed()
-    ver = pkg_config_version()
-    print(f"pkg-config opus version: {ver}")
-    if ver != EXPECTED_VERSION:
-        ci_utils.fail(f"Expected libopus {EXPECTED_VERSION} but found {ver}")
-
-    ci_utils.run(["cargo", "build", "--features", "system-lib"])
-    ci_utils.run(["cargo", "test", "--features", "system-lib"])
+    verify_pkg_config()
+    verify_system_build()
 
 
 if __name__ == "__main__":

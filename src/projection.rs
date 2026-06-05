@@ -10,14 +10,38 @@ use crate::bindings::{
     opus_projection_decoder_get_size, opus_projection_decoder_init, opus_projection_encode,
     opus_projection_encode_float, opus_projection_encoder_ctl, opus_projection_encoder_destroy,
 };
-use crate::constants::max_frame_samples_for;
+use crate::constants::{is_frame_size_2_5ms_aligned, max_frame_samples_for};
 use crate::error::{Error, Result};
 use crate::types::{Application, Bitrate, SampleRate};
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+
+fn validate_channels(channels: u8) -> Result<()> {
+    NonZeroU8::new(channels).ok_or(Error::BadArg)?;
+    Ok(())
+}
+
+fn validate_projection_mapping_family(mapping_family: i32) -> Result<()> {
+    if mapping_family == 3 {
+        Ok(())
+    } else {
+        Err(Error::BadArg)
+    }
+}
+
+fn validate_stream_counts(streams: u8, coupled_streams: u8) -> Result<()> {
+    let streams = NonZeroU8::new(streams).ok_or(Error::BadArg)?;
+    if coupled_streams > streams.get() {
+        return Err(Error::BadArg);
+    }
+    if usize::from(streams.get()) + usize::from(coupled_streams) > u8::MAX as usize {
+        return Err(Error::BadArg);
+    }
+    Ok(())
+}
 
 /// Safe wrapper around `OpusProjectionEncoder`.
 pub struct ProjectionEncoder {
@@ -29,7 +53,6 @@ pub struct ProjectionEncoder {
 }
 
 unsafe impl Send for ProjectionEncoder {}
-unsafe impl Sync for ProjectionEncoder {}
 
 /// Borrowed wrapper around a projection encoder state.
 pub struct ProjectionEncoderRef<'a> {
@@ -38,7 +61,6 @@ pub struct ProjectionEncoderRef<'a> {
 }
 
 unsafe impl Send for ProjectionEncoderRef<'_> {}
-unsafe impl Sync for ProjectionEncoderRef<'_> {}
 
 impl ProjectionEncoder {
     fn from_raw(
@@ -63,6 +85,8 @@ impl ProjectionEncoder {
     /// # Errors
     /// Returns [`Error::BadArg`] if the channel/mapping configuration is invalid.
     pub fn size(channels: u8, mapping_family: i32) -> Result<usize> {
+        validate_channels(channels)?;
+        validate_projection_mapping_family(mapping_family)?;
         let raw = unsafe {
             opus_projection_ambisonics_encoder_get_size(i32::from(channels), mapping_family)
         };
@@ -93,6 +117,7 @@ impl ProjectionEncoder {
         if !crate::opus_ptr_is_aligned(ptr.cast()) {
             return Err(Error::BadArg);
         }
+        Self::size(channels, mapping_family)?;
         let mut streams = 0i32;
         let mut coupled = 0i32;
         let r = unsafe {
@@ -129,6 +154,7 @@ impl ProjectionEncoder {
         mapping_family: i32,
         application: Application,
     ) -> Result<Self> {
+        Self::size(channels, mapping_family)?;
         let mut err = 0i32;
         let mut streams = 0i32;
         let mut coupled = 0i32;
@@ -168,7 +194,10 @@ impl ProjectionEncoder {
     }
 
     fn ensure_pcm_layout(&self, len: usize, frame_size_per_ch: usize) -> Result<()> {
-        if len != frame_size_per_ch * self.channels as usize {
+        let expected = frame_size_per_ch
+            .checked_mul(self.channels as usize)
+            .ok_or(Error::BadArg)?;
+        if len != expected {
             return Err(Error::BadArg);
         }
         Ok(())
@@ -285,6 +314,10 @@ impl ProjectionEncoder {
     /// when libopus reports an invalid matrix size.
     pub fn write_demixing_matrix(&mut self, out: &mut [u8]) -> Result<usize> {
         let size = self.demixing_matrix_size()?;
+        self.write_demixing_matrix_with_size(out, size)
+    }
+
+    fn write_demixing_matrix_with_size(&mut self, out: &mut [u8], size: i32) -> Result<usize> {
         if size <= 0 {
             return Err(Error::InternalError);
         }
@@ -315,7 +348,7 @@ impl ProjectionEncoder {
         let size = self.demixing_matrix_size()?;
         let len = usize::try_from(size).map_err(|_| Error::InternalError)?;
         let mut buf = vec![0u8; len];
-        self.write_demixing_matrix(&mut buf)?;
+        self.write_demixing_matrix_with_size(&mut buf, size)?;
         Ok(buf)
     }
 
@@ -367,8 +400,17 @@ impl<'a> ProjectionEncoderRef<'a> {
     /// # Safety
     /// - `ptr` must point to valid, initialized memory of at least [`ProjectionEncoder::size()`] bytes
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sample_rate`, `channels`, `streams`, and `coupled_streams` must exactly match
+    ///   the encoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes with the wrong layout and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned, or if the channel/stream
+    /// counts are invalid.
     ///
     /// Use [`ProjectionEncoder::init_in_place`] to initialize the memory before calling this.
     #[must_use]
@@ -379,10 +421,16 @@ impl<'a> ProjectionEncoderRef<'a> {
         streams: u8,
         coupled_streams: u8,
     ) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        assert!(
+            validate_channels(channels).is_ok(),
+            "ProjectionEncoderRef::from_raw called with zero channels"
+        );
+        assert!(
+            validate_stream_counts(streams, coupled_streams).is_ok(),
+            "ProjectionEncoderRef::from_raw called with invalid stream counts"
+        );
         let encoder = ProjectionEncoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, "ProjectionEncoderRef::from_raw"),
             sample_rate,
             channels,
             streams,
@@ -448,7 +496,6 @@ pub struct ProjectionDecoder {
 }
 
 unsafe impl Send for ProjectionDecoder {}
-unsafe impl Sync for ProjectionDecoder {}
 
 /// Borrowed wrapper around a projection decoder state.
 pub struct ProjectionDecoderRef<'a> {
@@ -457,7 +504,6 @@ pub struct ProjectionDecoderRef<'a> {
 }
 
 unsafe impl Send for ProjectionDecoderRef<'_> {}
-unsafe impl Sync for ProjectionDecoderRef<'_> {}
 
 impl ProjectionDecoder {
     fn from_raw(
@@ -482,6 +528,8 @@ impl ProjectionDecoder {
     /// # Errors
     /// Returns [`Error::BadArg`] if the channel/stream configuration is invalid.
     pub fn size(channels: u8, streams: u8, coupled_streams: u8) -> Result<usize> {
+        validate_channels(channels)?;
+        validate_stream_counts(streams, coupled_streams)?;
         let raw = unsafe {
             opus_projection_decoder_get_size(
                 i32::from(channels),
@@ -517,7 +565,13 @@ impl ProjectionDecoder {
         if !crate::opus_ptr_is_aligned(ptr.cast()) {
             return Err(Error::BadArg);
         }
+        Self::size(channels, streams, coupled_streams)?;
         let matrix_len = i32::try_from(demixing_matrix.len()).map_err(|_| Error::BadArg)?;
+        let mut demixing_matrix = demixing_matrix.to_vec();
+        // SAFETY: libopus' C ABI takes a non-const pointer despite documenting this
+        // parameter as input-only. Pass a mutable scratch copy so C never receives a
+        // mutable pointer into the caller's immutable slice. libopus copies the
+        // bytes before returning and does not retain this pointer.
         let r = unsafe {
             opus_projection_decoder_init(
                 ptr,
@@ -525,7 +579,7 @@ impl ProjectionDecoder {
                 i32::from(channels),
                 i32::from(streams),
                 i32::from(coupled_streams),
-                demixing_matrix.as_ptr().cast_mut(),
+                demixing_matrix.as_mut_ptr(),
                 matrix_len,
             )
         };
@@ -550,15 +604,19 @@ impl ProjectionDecoder {
         if demixing_matrix.is_empty() {
             return Err(Error::BadArg);
         }
+        Self::size(channels, streams, coupled_streams)?;
         let matrix_len = i32::try_from(demixing_matrix.len()).map_err(|_| Error::BadArg)?;
+        let mut demixing_matrix = demixing_matrix.to_vec();
         let mut err = 0i32;
+        // SAFETY: see comment in init_in_place; libopus copies the scratch input
+        // before returning and does not retain this pointer.
         let dec = unsafe {
             opus_projection_decoder_create(
                 sample_rate as i32,
                 i32::from(channels),
                 i32::from(streams),
                 i32::from(coupled_streams),
-                demixing_matrix.as_ptr().cast_mut(),
+                demixing_matrix.as_mut_ptr(),
                 matrix_len,
                 &raw mut err,
             )
@@ -586,7 +644,10 @@ impl ProjectionDecoder {
     }
 
     fn ensure_output_layout(&self, len: usize, frame_size_per_ch: usize) -> Result<()> {
-        if len != frame_size_per_ch * self.channels as usize {
+        let expected = frame_size_per_ch
+            .checked_mul(self.channels as usize)
+            .ok_or(Error::BadArg)?;
+        if len != expected {
             return Err(Error::BadArg);
         }
         Ok(())
@@ -607,6 +668,12 @@ impl ProjectionDecoder {
     ) -> Result<usize> {
         self.ensure_output_layout(out.len(), frame_size_per_ch)?;
         let frame_size = self.validate_frame_size(frame_size_per_ch)?;
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (packet.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size_per_ch, self.sample_rate)
+        {
+            return Err(Error::BadArg);
+        }
         let packet_len = if packet.is_empty() {
             0
         } else {
@@ -647,6 +714,12 @@ impl ProjectionDecoder {
     ) -> Result<usize> {
         self.ensure_output_layout(out.len(), frame_size_per_ch)?;
         let frame_size = self.validate_frame_size(frame_size_per_ch)?;
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (packet.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size_per_ch, self.sample_rate)
+        {
+            return Err(Error::BadArg);
+        }
         let packet_len = if packet.is_empty() {
             0
         } else {
@@ -703,8 +776,17 @@ impl<'a> ProjectionDecoderRef<'a> {
     /// # Safety
     /// - `ptr` must point to valid, initialized memory of at least [`ProjectionDecoder::size()`] bytes
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sample_rate`, `channels`, `streams`, and `coupled_streams` must exactly match
+    ///   the decoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes with the wrong layout and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned, or if the channel/stream
+    /// counts are invalid.
     ///
     /// Use [`ProjectionDecoder::init_in_place`] to initialize the memory before calling this.
     #[must_use]
@@ -715,10 +797,16 @@ impl<'a> ProjectionDecoderRef<'a> {
         streams: u8,
         coupled_streams: u8,
     ) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
+        assert!(
+            validate_channels(channels).is_ok(),
+            "ProjectionDecoderRef::from_raw called with zero channels"
+        );
+        assert!(
+            validate_stream_counts(streams, coupled_streams).is_ok(),
+            "ProjectionDecoderRef::from_raw called with invalid stream counts"
+        );
         let decoder = ProjectionDecoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, "ProjectionDecoderRef::from_raw"),
             sample_rate,
             channels,
             streams,

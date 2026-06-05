@@ -59,3 +59,31 @@ fn encoder_control_roundtrip() {
         .expect("clear force channels");
     assert_eq!(encoder.force_channels().expect("get forced channels"), None);
 }
+
+#[test]
+fn lookahead_uses_the_configured_sample_rate() {
+    let mut encoder_8k = Encoder::new(SampleRate::Hz8000, Channels::Mono, Application::Audio)
+        .expect("create 8 kHz encoder");
+    let mut encoder_48k = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
+        .expect("create 48 kHz encoder");
+
+    let lookahead_8k = encoder_8k.lookahead().expect("8 kHz lookahead");
+    let lookahead_48k = encoder_48k.lookahead().expect("48 kHz lookahead");
+    assert_eq!(lookahead_48k, lookahead_8k * 6);
+}
+
+#[cfg(all(feature = "dred", not(opus_codec_system_lib)))]
+#[test]
+fn dred_duration_is_an_encoder_ctl_in_ten_ms_frames() {
+    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
+        .expect("create DRED encoder");
+
+    encoder
+        .set_dred_duration(3)
+        .expect("set three 10-ms DRED frames");
+    assert_eq!(encoder.dred_duration().expect("get DRED duration"), 3);
+    assert_eq!(
+        encoder.set_dred_duration(-1),
+        Err(opus_codec::Error::BadArg)
+    );
+}

@@ -1,8 +1,8 @@
 use opus_codec::encoder::Encoder;
 use opus_codec::error::Error;
 use opus_codec::packet::{
-    packet_bandwidth, packet_channels, packet_frame_count, packet_parse, packet_sample_count,
-    soft_clip,
+    packet_bandwidth, packet_channels, packet_frame_count, packet_parse, packet_parse_into,
+    packet_sample_count, soft_clip,
 };
 use opus_codec::types::{Application, Bandwidth, Channels, SampleRate};
 
@@ -38,6 +38,24 @@ fn test_packet_parse_keeps_zero_length_frames() {
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].len(), 1);
     assert!(frames[1].is_empty());
+}
+
+#[test]
+fn test_packet_parse_into_uses_caller_storage() {
+    let packet = [0x02u8, 0x01, 0x00];
+    let mut frames = [&[][..]; 2];
+    let (toc, offset, count) = packet_parse_into(&packet, &mut frames).unwrap();
+    assert_eq!(toc, packet[0]);
+    assert_eq!(offset, 2);
+    assert_eq!(count, 2);
+    assert_eq!(frames[0], &[0]);
+    assert!(frames[1].is_empty());
+
+    let mut too_small = [&[][..]; 1];
+    assert_eq!(
+        packet_parse_into(&packet, &mut too_small),
+        Err(Error::BufferTooSmall)
+    );
 }
 
 #[test]

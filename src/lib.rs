@@ -38,7 +38,7 @@ pub use error::{Error, Result};
 pub use multistream::{Mapping, MultistreamDecoder, MultistreamEncoder};
 pub use packet::{
     packet_bandwidth, packet_channels, packet_frame_count, packet_has_lbrr, packet_parse,
-    packet_sample_count, packet_samples_per_frame, soft_clip,
+    packet_parse_into, packet_sample_count, packet_samples_per_frame, soft_clip,
 };
 pub use projection::{ProjectionDecoder, ProjectionEncoder};
 pub use repacketizer::Repacketizer;
@@ -50,7 +50,7 @@ pub use types::{
 #[doc(hidden)]
 pub use bindings::*;
 
-pub(crate) use raw::RawHandle;
+pub(crate) use raw::{RawHandle, checked_non_null};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ownership {
