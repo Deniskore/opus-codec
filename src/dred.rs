@@ -2,12 +2,12 @@
 //! This module is available when the `dred` Cargo feature is enabled.
 
 use crate::bindings::{
-    OpusDRED, OpusDREDDecoder, opus_decoder_dred_decode, opus_decoder_dred_decode_float,
-    opus_dred_alloc, opus_dred_decoder_create, opus_dred_decoder_ctl, opus_dred_decoder_destroy,
-    opus_dred_decoder_get_size, opus_dred_decoder_init, opus_dred_free, opus_dred_get_size,
-    opus_dred_parse, opus_dred_process,
+    OPUS_SET_DNN_BLOB_REQUEST, OpusDRED, OpusDREDDecoder, opus_decoder_dred_decode,
+    opus_decoder_dred_decode_float, opus_dred_alloc, opus_dred_decoder_create,
+    opus_dred_decoder_ctl, opus_dred_decoder_destroy, opus_dred_decoder_get_size,
+    opus_dred_decoder_init, opus_dred_free, opus_dred_get_size, opus_dred_parse, opus_dred_process,
 };
-use crate::constants::max_frame_samples_for;
+use crate::constants::{is_frame_size_2_5ms_aligned, max_frame_samples_for};
 use crate::decoder::Decoder;
 use crate::error::{Error, Result};
 use crate::types::SampleRate;
@@ -16,13 +16,15 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 
+// libopus computes `100 * max_dred_samples / sampling_rate` in signed 32-bit math.
+const MAX_SAFE_DRED_SAMPLES: usize = (i32::MAX as usize) / 100;
+
 /// Managed handle for libopus `OpusDREDDecoder`.
 pub struct DredDecoder {
     raw: RawHandle<OpusDREDDecoder>,
 }
 
 unsafe impl Send for DredDecoder {}
-unsafe impl Sync for DredDecoder {}
 
 /// Borrowed wrapper around an externally allocated DRED decoder.
 pub struct DredDecoderRef<'a> {
@@ -31,7 +33,6 @@ pub struct DredDecoderRef<'a> {
 }
 
 unsafe impl Send for DredDecoderRef<'_> {}
-unsafe impl Sync for DredDecoderRef<'_> {}
 
 impl DredDecoder {
     fn from_raw(ptr: NonNull<OpusDREDDecoder>, ownership: Ownership) -> Self {
@@ -88,29 +89,45 @@ impl DredDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InternalError`] if libopus reports an invalid (negative)
-    /// size, indicating a mismatch with the bundled headers.
+    /// Returns [`Error::InternalError`] if libopus reports a non-positive size,
+    /// indicating an unexpected ABI/runtime mismatch.
     pub fn size() -> Result<usize> {
         let raw = unsafe { opus_dred_decoder_get_size() };
+        if raw <= 0 {
+            return Err(Error::InternalError);
+        }
         usize::try_from(raw).map_err(|_| Error::InternalError)
     }
 
-    /// Run a control request directly.
+    /// Load an external DNN model blob into this DRED decoder.
     ///
     /// # Safety
     ///
-    /// The caller must ensure the request and argument combination is valid for the
-    /// underlying libopus build and that `arg` satisfies libopus expectations.
+    /// - `data` must contain a complete, correctly formatted libopus DNN weights blob. Some
+    ///   external-weight libopus builds do not safely handle malformed model records.
+    /// - The backing allocation must remain at the same address and valid for reads until this
+    ///   decoder is dropped, even when this method returns an error. Libopus model layers may
+    ///   retain pointers into the blob and model loading is not guaranteed to be transactional.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus
-    /// error when the control call fails.
-    pub unsafe fn control<T>(&mut self, request: i32, arg: T) -> Result<()>
-    where
-        T: Copy,
-    {
-        let r = unsafe { opus_dred_decoder_ctl(self.raw.as_ptr(), request, arg) };
+    /// Returns [`Error::BadArg`] for an empty, misaligned, or overlong blob,
+    /// [`Error::Unimplemented`] when the linked libopus was not built for external model
+    /// weights, or another mapped libopus error when loading fails.
+    pub unsafe fn set_dnn_blob(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() || !(data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<i32>())
+        {
+            return Err(Error::BadArg);
+        }
+        let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
+        let r = unsafe {
+            opus_dred_decoder_ctl(
+                self.raw.as_ptr(),
+                OPUS_SET_DNN_BLOB_REQUEST as i32,
+                data.as_ptr(),
+                len,
+            )
+        };
         if r != 0 {
             return Err(Error::from_code(r));
         }
@@ -133,7 +150,7 @@ impl DredDecoder {
         defer_processing: bool,
     ) -> Result<usize> {
         let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
-        let max_samples = i32::try_from(max_dred_samples).map_err(|_| Error::BadArg)?;
+        let max_samples = checked_max_dred_samples(max_dred_samples)?;
         let result = unsafe {
             opus_dred_parse(
                 self.raw.as_ptr(),
@@ -229,6 +246,13 @@ impl DredDecoder {
     }
 }
 
+fn checked_max_dred_samples(max_dred_samples: usize) -> Result<i32> {
+    if max_dred_samples > MAX_SAFE_DRED_SAMPLES {
+        return Err(Error::BadArg);
+    }
+    i32::try_from(max_dred_samples).map_err(|_| Error::BadArg)
+}
+
 impl<'a> DredDecoderRef<'a> {
     /// Wrap an externally-initialized DRED decoder without taking ownership.
     ///
@@ -238,12 +262,15 @@ impl<'a> DredDecoderRef<'a> {
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
     ///
     /// Use [`DredDecoder::init_in_place`] to initialize the memory before calling this.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned.
     #[must_use]
     pub unsafe fn from_raw(ptr: *mut OpusDREDDecoder) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
-        let decoder =
-            DredDecoder::from_raw(unsafe { NonNull::new_unchecked(ptr) }, Ownership::Borrowed);
+        let decoder = DredDecoder::from_raw(
+            crate::checked_non_null(ptr, "DredDecoderRef::from_raw"),
+            Ownership::Borrowed,
+        );
         Self {
             inner: decoder,
             _marker: PhantomData,
@@ -297,6 +324,10 @@ fn validate_pcm_frame_len<T>(
     if frame_size_per_ch == 0 || frame_size_per_ch > max_frame_samples_for(sample_rate) {
         return Err(Error::BadArg);
     }
+    // libopus requires DRED decode frame sizes to be multiples of 2.5 ms.
+    if !is_frame_size_2_5ms_aligned(frame_size_per_ch, sample_rate) {
+        return Err(Error::BadArg);
+    }
     i32::try_from(frame_size_per_ch).map_err(|_| Error::BadArg)
 }
 
@@ -306,7 +337,6 @@ pub struct DredState {
 }
 
 unsafe impl Send for DredState {}
-unsafe impl Sync for DredState {}
 
 impl DredState {
     /// Allocate a new DRED state.
@@ -316,12 +346,15 @@ impl DredState {
     /// Returns [`Error::AllocFail`] if allocation fails or a mapped libopus error when
     /// creation does not succeed.
     pub fn new() -> Result<Self> {
+        let size = Self::size()?;
         let mut err = 0;
         let ptr = unsafe { opus_dred_alloc(std::ptr::addr_of_mut!(err)) };
         if err != 0 {
             return Err(Error::from_code(err));
         }
         let ptr = NonNull::new(ptr).ok_or(Error::AllocFail)?;
+        // opus_dred_alloc() is malloc-like and does not initialize OpusDRED.
+        unsafe { std::ptr::write_bytes(ptr.as_ptr().cast::<u8>(), 0, size) };
         Ok(Self { raw: ptr })
     }
 
@@ -360,7 +393,8 @@ mod tests {
 
     #[test]
     fn validate_pcm_frame_len_checks_arguments() {
-        let pcm = vec![0i16; 4];
+        // 2.5 ms at 48 kHz = 120 samples/ch, so 240 total for stereo.
+        let pcm = vec![0i16; 240];
         assert!(validate_pcm_frame_len(&pcm, 2, SampleRate::Hz48000).is_ok());
 
         let err = validate_pcm_frame_len(&pcm, 0, SampleRate::Hz48000).unwrap_err();
@@ -371,5 +405,58 @@ mod tests {
 
         let err = validate_pcm_frame_len(&[] as &[i16], 2, SampleRate::Hz48000).unwrap_err();
         assert_eq!(err, Error::BadArg);
+
+        // Non-2.5ms-aligned frame size must be rejected.
+        let bad_pcm = vec![0i16; 4];
+        let err = validate_pcm_frame_len(&bad_pcm, 2, SampleRate::Hz48000).unwrap_err();
+        assert_eq!(err, Error::BadArg);
+    }
+
+    #[test]
+    fn checked_max_dred_samples_blocks_overflow_inputs() {
+        assert_eq!(
+            checked_max_dred_samples(MAX_SAFE_DRED_SAMPLES),
+            Ok(i32::MAX / 100)
+        );
+        assert_eq!(
+            checked_max_dred_samples(MAX_SAFE_DRED_SAMPLES + 1),
+            Err(Error::BadArg)
+        );
+    }
+
+    #[test]
+    fn fresh_dred_state_is_inactive() {
+        let mut decoder = match DredDecoder::new() {
+            Ok(decoder) => decoder,
+            Err(Error::Unimplemented) => return,
+            Err(err) => panic!("unexpected DRED decoder error: {err:?}"),
+        };
+        let state = match DredState::new() {
+            Ok(state) => state,
+            Err(Error::Unimplemented) => return,
+            Err(err) => panic!("unexpected DRED state error: {err:?}"),
+        };
+        let mut dst = DredState::new().unwrap();
+
+        assert_eq!(decoder.process(&state, &mut dst), Err(Error::BadArg));
+    }
+
+    #[cfg(not(opus_codec_system_lib))]
+    #[test]
+    fn typed_dnn_blob_ctl_has_checked_input_and_exact_abi() {
+        let model_word = 0u32;
+        let mut decoder = DredDecoder::new().expect("create bundled DRED decoder");
+        assert_eq!(unsafe { decoder.set_dnn_blob(&[]) }, Err(Error::BadArg));
+
+        let aligned_blob = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!(model_word).cast::<u8>(),
+                std::mem::size_of_val(&model_word),
+            )
+        };
+        assert_eq!(
+            unsafe { decoder.set_dnn_blob(aligned_blob) },
+            Err(Error::Unimplemented)
+        );
     }
 }

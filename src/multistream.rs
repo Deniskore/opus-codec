@@ -17,16 +17,16 @@ use crate::bindings::{
     OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
     OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, OPUS_SET_SIGNAL_REQUEST,
     OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
-    OpusDecoder, OpusEncoder, OpusMSDecoder, OpusMSEncoder, opus_multistream_decode,
-    opus_multistream_decode_float, opus_multistream_decoder_create, opus_multistream_decoder_ctl,
-    opus_multistream_decoder_destroy, opus_multistream_decoder_get_size,
-    opus_multistream_decoder_init, opus_multistream_encode, opus_multistream_encode_float,
-    opus_multistream_encoder_create, opus_multistream_encoder_ctl,
+    OpusDecoder, OpusEncoder, OpusMSDecoder, OpusMSEncoder, opus_decoder_ctl, opus_encoder_ctl,
+    opus_multistream_decode, opus_multistream_decode_float, opus_multistream_decoder_create,
+    opus_multistream_decoder_ctl, opus_multistream_decoder_destroy,
+    opus_multistream_decoder_get_size, opus_multistream_decoder_init, opus_multistream_encode,
+    opus_multistream_encode_float, opus_multistream_encoder_create, opus_multistream_encoder_ctl,
     opus_multistream_encoder_destroy, opus_multistream_encoder_get_size,
     opus_multistream_encoder_init, opus_multistream_surround_encoder_create,
     opus_multistream_surround_encoder_get_size, opus_multistream_surround_encoder_init,
 };
-use crate::constants::max_frame_samples_for;
+use crate::constants::{is_frame_size_2_5ms_aligned, max_frame_samples_for};
 use crate::error::{Error, Result};
 use crate::types::{Application, Bandwidth, Bitrate, Channels, Complexity, SampleRate, Signal};
 use crate::{AlignedBuffer, Ownership, RawHandle};
@@ -90,9 +90,9 @@ impl Mapping<'_> {
             return Err(Error::BadArg);
         }
 
-        let mut has_left = vec![false; coupled];
-        let mut has_right = vec![false; coupled];
-        let mut has_mono = vec![false; streams.saturating_sub(coupled)];
+        let mut has_left = [false; u8::MAX as usize];
+        let mut has_right = [false; u8::MAX as usize];
+        let mut has_mono = [false; u8::MAX as usize];
         for &entry in self.mapping {
             if entry == u8::MAX {
                 continue;
@@ -113,13 +113,98 @@ impl Mapping<'_> {
             }
         }
 
-        if has_left.iter().any(|has| !has) || has_right.iter().any(|has| !has) {
+        if has_left[..coupled].iter().any(|has| !has) || has_right[..coupled].iter().any(|has| !has)
+        {
             return Err(Error::BadArg);
         }
-        if has_mono.iter().any(|has| !has) {
+        if has_mono[..streams.saturating_sub(coupled)]
+            .iter()
+            .any(|has| !has)
+        {
             return Err(Error::BadArg);
         }
         Ok(())
+    }
+}
+
+// Keep these rules synchronized with `vorbis_mappings`,
+// `validate_ambisonics()`, and `opus_multistream_surround_encoder_init()` in
+// opus/src/opus_multistream_encoder.c. Tests compare every valid family 1 and
+// family 2 configuration against the linked libopus implementation.
+const VORBIS_SURROUND_MAPPINGS: [(&[u8], u8, u8); 8] = [
+    (&[0], 1, 0),
+    (&[0, 1], 1, 1),
+    (&[0, 2, 1], 2, 1),
+    (&[0, 1, 2, 3], 2, 2),
+    (&[0, 4, 1, 2, 3], 3, 2),
+    (&[0, 4, 1, 2, 3, 5], 4, 2),
+    (&[0, 4, 1, 2, 3, 5, 6], 4, 3),
+    (&[0, 6, 1, 2, 3, 4, 5, 7], 5, 3),
+];
+
+fn surround_mapping(channels: u8, mapping_family: i32) -> Result<(Vec<u8>, u8, u8)> {
+    let channel_count = usize::from(NonZeroU8::new(channels).ok_or(Error::BadArg)?.get());
+    match mapping_family {
+        0 => match channels {
+            1 => Ok((vec![0], 1, 0)),
+            2 => Ok((vec![0, 1], 1, 1)),
+            _ => Err(Error::BadArg),
+        },
+        1 if channel_count <= VORBIS_SURROUND_MAPPINGS.len() => {
+            let (mapping, streams, coupled) = VORBIS_SURROUND_MAPPINGS[channel_count - 1];
+            Ok((mapping.to_vec(), streams, coupled))
+        }
+        2 => {
+            if channels > 227 {
+                return Err(Error::BadArg);
+            }
+            let order_plus_one = (1usize..=15)
+                .take_while(|value| value * value <= channel_count)
+                .last()
+                .ok_or(Error::BadArg)?;
+            let ambisonic_channels = order_plus_one * order_plus_one;
+            let nondiegetic_channels = channel_count - ambisonic_channels;
+            if nondiegetic_channels != 0 && nondiegetic_channels != 2 {
+                return Err(Error::BadArg);
+            }
+
+            let coupled = u8::from(nondiegetic_channels != 0);
+            let streams = u8::try_from(ambisonic_channels + usize::from(coupled))
+                .map_err(|_| Error::BadArg)?;
+            let mut mapping = Vec::with_capacity(channel_count);
+            for channel in 0..ambisonic_channels {
+                mapping.push(
+                    u8::try_from(channel + 2 * usize::from(coupled)).map_err(|_| Error::BadArg)?,
+                );
+            }
+            mapping.extend(0..2 * coupled);
+            Ok((mapping, streams, coupled))
+        }
+        255 => Ok(((0..channels).collect(), channels, 0)),
+        _ => Err(Error::BadArg),
+    }
+}
+
+fn validate_stream_counts(streams: u8, coupled_streams: u8) -> Result<()> {
+    let streams = NonZeroU8::new(streams).ok_or(Error::BadArg)?;
+    if coupled_streams > streams.get() {
+        return Err(Error::BadArg);
+    }
+    if usize::from(streams.get()) + usize::from(coupled_streams) > u8::MAX as usize {
+        return Err(Error::BadArg);
+    }
+    Ok(())
+}
+
+fn bandwidth_from_ctl(value: i32) -> Result<Bandwidth> {
+    let value = u32::try_from(value).map_err(|_| Error::InternalError)?;
+    match value {
+        x if x == OPUS_BANDWIDTH_NARROWBAND => Ok(Bandwidth::Narrowband),
+        x if x == OPUS_BANDWIDTH_MEDIUMBAND => Ok(Bandwidth::Mediumband),
+        x if x == OPUS_BANDWIDTH_WIDEBAND => Ok(Bandwidth::Wideband),
+        x if x == OPUS_BANDWIDTH_SUPERWIDEBAND => Ok(Bandwidth::SuperWideband),
+        x if x == OPUS_BANDWIDTH_FULLBAND => Ok(Bandwidth::Fullband),
+        _ => Err(Error::InternalError),
     }
 }
 
@@ -133,7 +218,6 @@ pub struct MultistreamEncoder {
 }
 
 unsafe impl Send for MultistreamEncoder {}
-unsafe impl Sync for MultistreamEncoder {}
 
 /// Borrowed wrapper around a multistream encoder.
 pub struct MultistreamEncoderRef<'a> {
@@ -142,7 +226,6 @@ pub struct MultistreamEncoderRef<'a> {
 }
 
 unsafe impl Send for MultistreamEncoderRef<'_> {}
-unsafe impl Sync for MultistreamEncoderRef<'_> {}
 
 impl MultistreamEncoder {
     fn from_raw(
@@ -168,6 +251,7 @@ impl MultistreamEncoder {
     /// Returns [`Error::BadArg`] if the stream counts are invalid or libopus reports
     /// an impossible size.
     pub fn size(streams: u8, coupled_streams: u8) -> Result<usize> {
+        validate_stream_counts(streams, coupled_streams)?;
         let raw = unsafe {
             opus_multistream_encoder_get_size(i32::from(streams), i32::from(coupled_streams))
         };
@@ -182,6 +266,9 @@ impl MultistreamEncoder {
     /// # Errors
     /// Returns [`Error::BadArg`] if the channel/mapping configuration is invalid.
     pub fn surround_size(channels: u8, mapping_family: i32) -> Result<usize> {
+        if channels == 0 {
+            return Err(Error::BadArg);
+        }
         let raw = unsafe {
             opus_multistream_surround_encoder_get_size(i32::from(channels), mapping_family)
         };
@@ -189,6 +276,18 @@ impl MultistreamEncoder {
             return Err(Error::BadArg);
         }
         usize::try_from(raw).map_err(|_| Error::InternalError)
+    }
+
+    /// Return the standard channel mapping and stream counts for a surround family.
+    ///
+    /// This mirrors the family 0, 1, 2, and 255 rules used by
+    /// `opus_multistream_surround_encoder_init()`, without allocating an
+    /// encoder state.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if the channel count or mapping family is invalid.
+    pub fn surround_mapping(channels: u8, mapping_family: i32) -> Result<(Vec<u8>, u8, u8)> {
+        surround_mapping(channels, mapping_family)
     }
 
     /// Initialize a previously allocated multistream encoder state.
@@ -251,6 +350,7 @@ impl MultistreamEncoder {
         if !crate::opus_ptr_is_aligned(ptr.cast()) {
             return Err(Error::BadArg);
         }
+        Self::surround_size(channels, mapping_family)?;
         let mut streams = 0i32;
         let mut coupled = 0i32;
         let mut mapping = vec![0u8; channels as usize];
@@ -448,9 +548,8 @@ impl MultistreamEncoder {
     /// if the response is outside the valid range, or propagates any error reported by libopus.
     pub fn complexity(&mut self) -> Result<Complexity> {
         let v = self.get_int_ctl(OPUS_GET_COMPLEXITY_REQUEST as i32)?;
-        Ok(Complexity::new(
-            u32::try_from(v).map_err(|_| Error::InternalError)?,
-        ))
+        let complexity = u32::try_from(v).map_err(|_| Error::InternalError)?;
+        Complexity::try_new(complexity).ok_or(Error::InternalError)
     }
 
     /// Enable/disable discontinuous transmission (DTX).
@@ -471,13 +570,21 @@ impl MultistreamEncoder {
         self.get_bool_ctl(OPUS_GET_DTX_REQUEST as i32)
     }
 
-    /// Query whether the encoder is currently in DTX.
+    /// Query whether every coded stream is currently in DTX.
+    ///
+    /// Libopus does not forward `OPUS_GET_IN_DTX` through its multistream dispatcher, so this
+    /// queries each underlying encoder state and returns true only when all streams report DTX.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder handle is null or propagates any error
     /// reported by libopus.
     pub fn in_dtx(&mut self) -> Result<bool> {
-        self.get_bool_ctl(OPUS_GET_IN_DTX_REQUEST as i32)
+        for stream_index in 0..i32::from(self.streams) {
+            if self.encoder_int_ctl(stream_index, OPUS_GET_IN_DTX_REQUEST as i32)? == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Enable/disable in-band FEC generation.
@@ -567,13 +674,17 @@ impl MultistreamEncoder {
         self.simple_ctl(OPUS_SET_MAX_BANDWIDTH_REQUEST as i32, bw as i32)
     }
 
-    /// Query the configured maximum bandwidth.
+    /// Query the configured maximum bandwidth of the first coded stream.
+    ///
+    /// [`Self::set_max_bandwidth`] applies the value to every stream. Direct mutation through
+    /// [`Self::encoder_state_ptr`] can make per-stream values differ; this getter then reports
+    /// stream zero, matching libopus' convention for supported multistream integer getters.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder handle is null, [`Error::InternalError`]
     /// if the value cannot be represented, or propagates any error reported by libopus.
     pub fn max_bandwidth(&mut self) -> Result<Bandwidth> {
-        self.get_bandwidth_ctl(OPUS_GET_MAX_BANDWIDTH_REQUEST as i32)
+        bandwidth_from_ctl(self.encoder_int_ctl(0, OPUS_GET_MAX_BANDWIDTH_REQUEST as i32)?)
     }
 
     /// Force a specific output bandwidth (overrides automatic selection).
@@ -647,7 +758,7 @@ impl MultistreamEncoder {
         }
     }
 
-    /// Query the algorithmic lookahead in samples at 48 kHz.
+    /// Query the algorithmic lookahead in samples at this encoder's configured sample rate.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder handle is null or propagates any error
@@ -679,7 +790,7 @@ impl MultistreamEncoder {
     pub const fn sample_rate(&self) -> SampleRate {
         self.sample_rate
     }
-    /// Number of mono streams.
+    /// Total number of coded streams, including coupled streams.
     #[must_use]
     pub const fn streams(&self) -> u8 {
         self.streams
@@ -701,9 +812,7 @@ impl MultistreamEncoder {
         mapping_family: i32,
         app: Application,
     ) -> Result<(Self, Vec<u8>)> {
-        if channels == 0 {
-            return Err(Error::BadArg);
-        }
+        Self::surround_size(channels, mapping_family)?;
         let mut err = 0i32;
         let mut streams = 0i32;
         let mut coupled = 0i32;
@@ -742,6 +851,13 @@ impl MultistreamEncoder {
     /// Returns [`Error::InvalidState`] if the encoder handle is invalid or propagates the
     /// libopus error if retrieving the state fails.
     pub unsafe fn encoder_state_ptr(&mut self, stream_index: i32) -> Result<*mut OpusEncoder> {
+        Ok(self.encoder_state(stream_index)?.as_ptr())
+    }
+
+    fn encoder_state(&mut self, stream_index: i32) -> Result<NonNull<OpusEncoder>> {
+        if stream_index < 0 || stream_index >= i32::from(self.streams) {
+            return Err(Error::BadArg);
+        }
         let mut state: *mut OpusEncoder = std::ptr::null_mut();
         let r = unsafe {
             opus_multistream_encoder_ctl(
@@ -754,10 +870,17 @@ impl MultistreamEncoder {
         if r != 0 {
             return Err(Error::from_code(r));
         }
-        if state.is_null() {
-            return Err(Error::InternalError);
+        NonNull::new(state).ok_or(Error::InternalError)
+    }
+
+    fn encoder_int_ctl(&mut self, stream_index: i32, req: i32) -> Result<i32> {
+        let state = self.encoder_state(stream_index)?;
+        let mut value = 0i32;
+        let r = unsafe { opus_encoder_ctl(state.as_ptr(), req, &mut value) };
+        if r != 0 {
+            return Err(Error::from_code(r));
         }
-        Ok(state)
+        Ok(value)
     }
 
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
@@ -782,44 +905,69 @@ impl MultistreamEncoder {
     }
 
     fn get_bandwidth_ctl(&mut self, req: i32) -> Result<Bandwidth> {
-        let v = u32::try_from(self.get_int_ctl(req)?).map_err(|_| Error::InternalError)?;
-        match v {
-            x if x == OPUS_BANDWIDTH_NARROWBAND => Ok(Bandwidth::Narrowband),
-            x if x == OPUS_BANDWIDTH_MEDIUMBAND => Ok(Bandwidth::Mediumband),
-            x if x == OPUS_BANDWIDTH_WIDEBAND => Ok(Bandwidth::Wideband),
-            x if x == OPUS_BANDWIDTH_SUPERWIDEBAND => Ok(Bandwidth::SuperWideband),
-            x if x == OPUS_BANDWIDTH_FULLBAND => Ok(Bandwidth::Fullband),
-            _ => Err(Error::InternalError),
-        }
+        bandwidth_from_ctl(self.get_int_ctl(req)?)
     }
 }
 
 impl<'a> MultistreamEncoderRef<'a> {
-    /// Wrap an externally-initialized multistream encoder without taking ownership.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, initialized memory of at least [`MultistreamEncoder::size()`] bytes
-    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
-    /// - The memory must remain valid for the lifetime `'a`
-    /// - Caller is responsible for freeing the memory after this wrapper is dropped
-    ///
-    /// Use [`MultistreamEncoder::init_in_place`] to initialize the memory before calling this.
-    #[must_use]
-    pub unsafe fn from_raw(ptr: *mut OpusMSEncoder, sr: SampleRate, mapping: Mapping<'_>) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
-        debug_assert!(mapping.validate_for_encoder().is_ok());
+    unsafe fn from_raw_parts(
+        ptr: *mut OpusMSEncoder,
+        sr: SampleRate,
+        channels: u8,
+        streams: u8,
+        coupled_streams: u8,
+        caller: &str,
+    ) -> Self {
+        assert!(channels != 0, "{caller} called with zero channels");
+        assert!(
+            validate_stream_counts(streams, coupled_streams).is_ok(),
+            "{caller} called with invalid stream counts"
+        );
         let encoder = MultistreamEncoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, caller),
             sr,
-            mapping.channels,
-            mapping.streams,
-            mapping.coupled_streams,
+            channels,
+            streams,
+            coupled_streams,
             Ownership::Borrowed,
         );
         Self {
             inner: encoder,
             _marker: PhantomData,
+        }
+    }
+
+    /// Wrap an externally-initialized multistream encoder without taking ownership.
+    ///
+    /// # Safety
+    /// - `ptr` must point to valid, initialized memory of at least [`MultistreamEncoder::size()`] bytes
+    /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sr` and `mapping` must exactly match the encoder state already stored at `ptr`
+    /// - The memory must remain valid for the lifetime `'a`
+    /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes with the wrong layout and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null, not pointer-aligned, or `mapping` is invalid.
+    ///
+    /// Use [`MultistreamEncoder::init_in_place`] to initialize the memory before calling this.
+    #[must_use]
+    pub unsafe fn from_raw(ptr: *mut OpusMSEncoder, sr: SampleRate, mapping: Mapping<'_>) -> Self {
+        assert!(
+            mapping.validate_for_encoder().is_ok(),
+            "MultistreamEncoderRef::from_raw called with invalid mapping"
+        );
+        unsafe {
+            Self::from_raw_parts(
+                ptr,
+                sr,
+                mapping.channels,
+                mapping.streams,
+                mapping.coupled_streams,
+                "MultistreamEncoderRef::from_raw",
+            )
         }
     }
 
@@ -861,13 +1009,16 @@ impl<'a> MultistreamEncoderRef<'a> {
         let (streams, coupled, mapping) = unsafe {
             MultistreamEncoder::init_surround_in_place(ptr, sr, channels, mapping_family, app)?
         };
-        let mapping_ref = Mapping {
-            channels,
-            streams,
-            coupled_streams: coupled,
-            mapping: &mapping,
+        let encoder = unsafe {
+            Self::from_raw_parts(
+                ptr,
+                sr,
+                channels,
+                streams,
+                coupled,
+                "MultistreamEncoderRef::init_in_surround",
+            )
         };
-        let encoder = unsafe { Self::from_raw(ptr, sr, mapping_ref) };
         Ok((encoder, mapping))
     }
 }
@@ -894,7 +1045,6 @@ pub struct MultistreamDecoder {
 }
 
 unsafe impl Send for MultistreamDecoder {}
-unsafe impl Sync for MultistreamDecoder {}
 
 /// Borrowed wrapper around a multistream decoder.
 pub struct MultistreamDecoderRef<'a> {
@@ -903,7 +1053,6 @@ pub struct MultistreamDecoderRef<'a> {
 }
 
 unsafe impl Send for MultistreamDecoderRef<'_> {}
-unsafe impl Sync for MultistreamDecoderRef<'_> {}
 
 impl MultistreamDecoder {
     fn from_raw(
@@ -925,6 +1074,7 @@ impl MultistreamDecoder {
     /// Returns [`Error::BadArg`] if the stream counts are invalid or libopus reports
     /// an impossible size.
     pub fn size(streams: u8, coupled_streams: u8) -> Result<usize> {
+        validate_stream_counts(streams, coupled_streams)?;
         let raw = unsafe {
             opus_multistream_decoder_get_size(i32::from(streams), i32::from(coupled_streams))
         };
@@ -1015,6 +1165,12 @@ impl MultistreamDecoder {
         if out.len() != frame_size_per_ch.get() * self.channels as usize {
             return Err(Error::BadArg);
         }
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (packet.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size_per_ch.get(), self.sample_rate)
+        {
+            return Err(Error::BadArg);
+        }
         let n = unsafe {
             opus_multistream_decode(
                 self.raw.as_ptr(),
@@ -1056,6 +1212,12 @@ impl MultistreamDecoder {
             return Err(Error::BadArg);
         }
         if out.len() != frame_size_per_ch.get() * self.channels as usize {
+            return Err(Error::BadArg);
+        }
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (packet.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size_per_ch.get(), self.sample_rate)
+        {
             return Err(Error::BadArg);
         }
         let n = unsafe {
@@ -1163,13 +1325,17 @@ impl MultistreamDecoder {
         self.get_int_ctl(OPUS_GET_SAMPLE_RATE_REQUEST as i32)
     }
 
-    /// Query the pitch (fundamental period) of the last decoded frame.
+    /// Query the pitch of the first coded stream's last decoded frame.
+    ///
+    /// The value is the fundamental period in samples at 48 kHz. Libopus does not forward
+    /// `OPUS_GET_PITCH` through its multistream dispatcher, so this follows the dispatcher's
+    /// convention for scalar getters and queries stream zero explicitly.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the decoder handle is null or propagates any error
     /// reported by libopus.
     pub fn get_pitch(&mut self) -> Result<i32> {
-        self.get_int_ctl(OPUS_GET_PITCH_REQUEST as i32)
+        self.decoder_int_ctl(0, OPUS_GET_PITCH_REQUEST as i32)
     }
 
     /// Query the duration (per channel) of the last decoded packet.
@@ -1192,7 +1358,7 @@ impl MultistreamDecoder {
         self.sample_rate
     }
 
-    /// Create a multistream decoder using libopus surround mapping helpers.
+    /// Create a multistream decoder using the standard libopus surround mapping.
     ///
     /// # Errors
     /// Returns [`Error::BadArg`] for invalid channel counts or the mapped libopus
@@ -1202,39 +1368,16 @@ impl MultistreamDecoder {
         channels: u8,
         mapping_family: i32,
     ) -> Result<(Self, Vec<u8>, u8, u8)> {
-        if channels == 0 {
-            return Err(Error::BadArg);
-        }
+        MultistreamEncoder::surround_size(channels, mapping_family)?;
+        let (mapping, streams, coupled) =
+            MultistreamEncoder::surround_mapping(channels, mapping_family)?;
         let mut err = 0i32;
-        let mut streams = 0i32;
-        let mut coupled = 0i32;
-        let mut mapping = vec![0u8; channels as usize];
-        // libopus exposes surround helper creation only for encoders; callers
-        // should use the returned mapping/stream counts to configure this decoder.
-        let enc = unsafe {
-            opus_multistream_surround_encoder_create(
-                sr as i32,
-                i32::from(channels),
-                mapping_family,
-                std::ptr::addr_of_mut!(streams),
-                std::ptr::addr_of_mut!(coupled),
-                mapping.as_mut_ptr(),
-                Application::Audio as i32,
-                std::ptr::addr_of_mut!(err),
-            )
-        };
-        if !enc.is_null() {
-            unsafe { opus_multistream_encoder_destroy(enc) };
-        }
-        if err != 0 {
-            return Err(Error::from_code(err));
-        }
         let dec = unsafe {
             opus_multistream_decoder_create(
                 sr as i32,
                 i32::from(channels),
-                streams,
-                coupled,
+                i32::from(streams),
+                i32::from(coupled),
                 mapping.as_ptr(),
                 std::ptr::addr_of_mut!(err),
             )
@@ -1246,8 +1389,8 @@ impl MultistreamDecoder {
         Ok((
             Self::from_raw(dec, sr, channels, Ownership::Owned),
             mapping,
-            u8::try_from(streams).map_err(|_| Error::BadArg)?,
-            u8::try_from(coupled).map_err(|_| Error::BadArg)?,
+            streams,
+            coupled,
         ))
     }
 
@@ -1261,6 +1404,10 @@ impl MultistreamDecoder {
     /// Returns [`Error::InvalidState`] if the decoder handle is invalid or propagates the
     /// libopus error when retrieving the per-stream state fails.
     pub unsafe fn decoder_state_ptr(&mut self, stream_index: i32) -> Result<*mut OpusDecoder> {
+        Ok(self.decoder_state(stream_index)?.as_ptr())
+    }
+
+    fn decoder_state(&mut self, stream_index: i32) -> Result<NonNull<OpusDecoder>> {
         let mut state: *mut OpusDecoder = std::ptr::null_mut();
         let r = unsafe {
             opus_multistream_decoder_ctl(
@@ -1273,10 +1420,17 @@ impl MultistreamDecoder {
         if r != 0 {
             return Err(Error::from_code(r));
         }
-        if state.is_null() {
-            return Err(Error::InternalError);
+        NonNull::new(state).ok_or(Error::InternalError)
+    }
+
+    fn decoder_int_ctl(&mut self, stream_index: i32, req: i32) -> Result<i32> {
+        let state = self.decoder_state(stream_index)?;
+        let mut value = 0i32;
+        let r = unsafe { opus_decoder_ctl(state.as_ptr(), req, &mut value) };
+        if r != 0 {
+            return Err(Error::from_code(r));
         }
-        Ok(state)
+        Ok(value)
     }
 
     fn simple_ctl(&mut self, req: i32, val: i32) -> Result<()> {
@@ -1307,17 +1461,25 @@ impl<'a> MultistreamDecoderRef<'a> {
     /// # Safety
     /// - `ptr` must point to valid, initialized memory of at least [`MultistreamDecoder::size()`] bytes
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sr` and `mapping` must exactly match the decoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes with the wrong layout and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null, not pointer-aligned, or `mapping` is invalid.
     ///
     /// Use [`MultistreamDecoder::init_in_place`] to initialize the memory before calling this.
     #[must_use]
     pub unsafe fn from_raw(ptr: *mut OpusMSDecoder, sr: SampleRate, mapping: Mapping<'_>) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
-        debug_assert!(mapping.validate_for_decoder().is_ok());
+        assert!(
+            mapping.validate_for_decoder().is_ok(),
+            "MultistreamDecoderRef::from_raw called with invalid mapping"
+        );
         let decoder = MultistreamDecoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, "MultistreamDecoderRef::from_raw"),
             sr,
             mapping.channels,
             Ownership::Borrowed,

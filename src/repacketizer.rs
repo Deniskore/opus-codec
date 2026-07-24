@@ -6,6 +6,8 @@ use crate::bindings::{
     opus_repacketizer_out, opus_repacketizer_out_range,
 };
 use crate::error::{Error, Result};
+#[cfg(opus_codec_rust_packet_ops)]
+use crate::packet;
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -14,11 +16,16 @@ use std::ptr::NonNull;
 /// Repackages Opus frames into packets.
 pub struct Repacketizer {
     rp: RawHandle<OpusRepacketizer>,
-    packets: Vec<Vec<u8>>,
+    packets: Vec<RetainedPacket>,
+}
+
+struct RetainedPacket {
+    data: Vec<u8>,
+    #[cfg(opus_codec_rust_packet_ops)]
+    layout: Result<packet::PacketRepacketizerLayout>,
 }
 
 unsafe impl Send for Repacketizer {}
-unsafe impl Sync for Repacketizer {}
 
 /// Borrowed wrapper around a repacketizer state.
 pub struct RepacketizerRef<'a> {
@@ -27,7 +34,6 @@ pub struct RepacketizerRef<'a> {
 }
 
 unsafe impl Send for RepacketizerRef<'_> {}
-unsafe impl Sync for RepacketizerRef<'_> {}
 
 impl Repacketizer {
     fn from_raw(ptr: NonNull<OpusRepacketizer>, ownership: Ownership) -> Self {
@@ -60,19 +66,35 @@ impl Repacketizer {
     /// # Errors
     /// Returns an error if the packet is invalid for the current state.
     pub fn push(&mut self, packet: &[u8]) -> Result<()> {
+        if packet.is_empty() || i32::try_from(packet.len()).is_err() {
+            return Err(Error::BadArg);
+        }
+        self.push_owned(packet.to_vec())
+    }
+
+    /// Add an owned packet to the current state without copying its payload.
+    ///
+    /// The packet is retained until the next call to [`Self::reset`].
+    ///
+    /// # Errors
+    /// Returns an error if the packet is invalid for the current state.
+    pub fn push_owned(&mut self, packet: Vec<u8>) -> Result<()> {
         if packet.is_empty() {
             return Err(Error::BadArg);
         }
         let len_i32 = i32::try_from(packet.len()).map_err(|_| Error::BadArg)?;
-        self.packets.push(packet.to_vec());
-        let idx = self.packets.len() - 1;
-        let r =
-            unsafe { opus_repacketizer_cat(self.rp.as_ptr(), self.packets[idx].as_ptr(), len_i32) };
+        #[cfg(opus_codec_rust_packet_ops)]
+        let layout = packet::packet_repacketizer_layout(&packet);
+        let r = unsafe { opus_repacketizer_cat(self.rp.as_ptr(), packet.as_ptr(), len_i32) };
         if r != 0 {
-            self.packets.pop();
             return Err(Error::from_code(r));
         }
         // libopus stores pointers into packet data; keep owned buffers alive.
+        self.packets.push(RetainedPacket {
+            data: packet,
+            #[cfg(opus_codec_rust_packet_ops)]
+            layout,
+        });
         Ok(())
     }
 
@@ -102,7 +124,8 @@ impl Repacketizer {
     /// Emit a packet containing frames in range [begin, end).
     ///
     /// # Errors
-    /// Returns an error if range is invalid or output buffer is too small.
+    /// Returns [`Error::BadArg`] if the range is invalid or `out` is empty, or
+    /// [`Error::BufferTooSmall`] if `out` cannot hold the packet.
     pub fn emit_range(&mut self, begin: i32, end: i32, out: &mut [u8]) -> Result<usize> {
         if out.is_empty() {
             return Err(Error::BadArg);
@@ -110,30 +133,66 @@ impl Repacketizer {
         if begin < 0 || end <= begin {
             return Err(Error::BadArg);
         }
-        let out_len_i32 = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
-        let n = unsafe {
-            opus_repacketizer_out_range(self.rp.as_ptr(), begin, end, out.as_mut_ptr(), out_len_i32)
-        };
-        if n < 0 {
-            return Err(Error::from_code(n));
+        #[cfg(opus_codec_rust_packet_ops)]
+        let begin_index = usize::try_from(begin).map_err(|_| Error::BadArg)?;
+        #[cfg(opus_codec_rust_packet_ops)]
+        let end_index = usize::try_from(end).map_err(|_| Error::BadArg)?;
+        #[cfg(not(opus_codec_rust_packet_ops))]
+        {
+            self.emit_range_via_c(begin, end, out)
         }
-        usize::try_from(n).map_err(|_| Error::InternalError)
+        #[cfg(opus_codec_rust_packet_ops)]
+        {
+            let mut frames = [&[][..]; packet::MAX_FRAMES_PER_PACKET];
+            let mut paddings = [packet::PacketPadding::EMPTY; packet::MAX_FRAMES_PER_PACKET];
+            if let Some((toc, frame_count)) =
+                self.repacketizer_inputs(&mut frames, &mut paddings)?
+            {
+                if end_index > frame_count {
+                    return Err(Error::BadArg);
+                }
+                return packet::repacketize_frames_range(
+                    toc,
+                    &frames[..frame_count],
+                    &paddings[..frame_count],
+                    begin_index,
+                    end_index,
+                    out,
+                );
+            }
+            self.emit_range_via_c(begin, end, out)
+        }
     }
 
     /// Emit a packet with all queued frames.
     ///
     /// # Errors
-    /// Returns an error if the output buffer is too small.
+    /// Returns [`Error::BadArg`] if `out` is empty, or [`Error::BufferTooSmall`]
+    /// if `out` cannot hold the packet.
     pub fn emit(&mut self, out: &mut [u8]) -> Result<usize> {
         if out.is_empty() {
             return Err(Error::BadArg);
         }
-        let out_len_i32 = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
-        let n = unsafe { opus_repacketizer_out(self.rp.as_ptr(), out.as_mut_ptr(), out_len_i32) };
-        if n < 0 {
-            return Err(Error::from_code(n));
+        #[cfg(not(opus_codec_rust_packet_ops))]
+        {
+            self.emit_via_c(out)
         }
-        usize::try_from(n).map_err(|_| Error::InternalError)
+        #[cfg(opus_codec_rust_packet_ops)]
+        {
+            let mut frames = [&[][..]; packet::MAX_FRAMES_PER_PACKET];
+            let mut paddings = [packet::PacketPadding::EMPTY; packet::MAX_FRAMES_PER_PACKET];
+            if let Some((toc, frame_count)) =
+                self.repacketizer_inputs(&mut frames, &mut paddings)?
+            {
+                return packet::repacketize_frames(
+                    toc,
+                    &frames[..frame_count],
+                    &paddings[..frame_count],
+                    out,
+                );
+            }
+            self.emit_via_c(out)
+        }
     }
 
     /// Size of a repacketizer state in bytes for external allocation.
@@ -166,6 +225,82 @@ impl Repacketizer {
         unsafe { opus_repacketizer_init(ptr) };
         Ok(())
     }
+
+    #[cfg(opus_codec_rust_packet_ops)]
+    fn repacketizer_inputs<'a>(
+        &'a self,
+        frames: &mut [&'a [u8]; packet::MAX_FRAMES_PER_PACKET],
+        paddings: &mut [packet::PacketPadding<'a>; packet::MAX_FRAMES_PER_PACKET],
+    ) -> Result<Option<(u8, usize)>> {
+        let c_frame_count = self.len();
+        if self.packets.is_empty() {
+            return if c_frame_count == 0 {
+                Err(Error::BadArg)
+            } else {
+                Ok(None)
+            };
+        }
+
+        let mut toc = None;
+        let mut frame_count = 0usize;
+        for packet in &self.packets {
+            let layout = match &packet.layout {
+                Ok(layout) => layout,
+                // The packet was already accepted by opus_repacketizer_cat().
+                // Treat a Rust/C structural-parser disagreement as an
+                // unavailable optimization and let the caller use C output.
+                Err(Error::InvalidPacket) => return Ok(None),
+                Err(err) => return Err(err.clone()),
+            };
+            toc.get_or_insert(layout.toc);
+            let packet_frame_count = layout.frames().len();
+            if frame_count + packet_frame_count > packet::MAX_FRAMES_PER_PACKET {
+                return Ok(None);
+            }
+            for (packet_frame, frame) in layout.frames().iter().enumerate() {
+                frames[frame_count] = frame.slice(&packet.data)?;
+                paddings[frame_count] = if packet_frame == 0 {
+                    layout.packet_padding(&packet.data)
+                } else {
+                    packet::PacketPadding::EMPTY
+                };
+                frame_count += 1;
+            }
+        }
+
+        if frame_count != c_frame_count {
+            return Ok(None);
+        }
+
+        let toc = toc.ok_or(Error::BadArg)?;
+        Ok(Some((toc, frame_count)))
+    }
+
+    fn emit_range_via_c(&self, begin: i32, end: i32, out: &mut [u8]) -> Result<usize> {
+        if out.is_empty() {
+            return Err(Error::BadArg);
+        }
+        let out_len_i32 = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
+        let n = unsafe {
+            opus_repacketizer_out_range(self.rp.as_ptr(), begin, end, out.as_mut_ptr(), out_len_i32)
+        };
+        if n < 0 {
+            return Err(Error::from_code(n));
+        }
+        usize::try_from(n).map_err(|_| Error::InternalError)
+    }
+
+    fn emit_via_c(&self, out: &mut [u8]) -> Result<usize> {
+        if out.is_empty() {
+            return Err(Error::BadArg);
+        }
+        let out_len_i32 = i32::try_from(out.len()).map_err(|_| Error::BadArg)?;
+        let n = unsafe { opus_repacketizer_out(self.rp.as_ptr(), out.as_mut_ptr(), out_len_i32) };
+        if n < 0 {
+            return Err(Error::from_code(n));
+        }
+        usize::try_from(n).map_err(|_| Error::InternalError)
+    }
 }
 
 impl<'a> RepacketizerRef<'a> {
@@ -176,14 +311,21 @@ impl<'a> RepacketizerRef<'a> {
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    /// - If `ptr` already contains packet pointers, their backing storage must
+    ///   remain valid while this wrapper is used.
     ///
     /// Use [`Repacketizer::init_in_place`] to initialize the memory before calling this.
+    /// If packets are pushed through this wrapper, dropping it resets the raw
+    /// state to avoid leaving dangling pointers to the wrapper's owned buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned.
     #[must_use]
     pub unsafe fn from_raw(ptr: *mut OpusRepacketizer) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
-        let repacketizer =
-            Repacketizer::from_raw(unsafe { NonNull::new_unchecked(ptr) }, Ownership::Borrowed);
+        let repacketizer = Repacketizer::from_raw(
+            crate::checked_non_null(ptr, "RepacketizerRef::from_raw"),
+            Ownership::Borrowed,
+        );
         Self {
             inner: repacketizer,
             _marker: PhantomData,
@@ -205,6 +347,18 @@ impl<'a> RepacketizerRef<'a> {
     }
 }
 
+impl Drop for RepacketizerRef<'_> {
+    fn drop(&mut self) {
+        if !self.inner.packets.is_empty() {
+            // Reinitialize the external C state to clear packet pointers that
+            // reference our `self.inner.packets` buffers, which are about to be
+            // freed.  Without this the caller could reuse the external
+            // OpusRepacketizer and dereference dangling pointers.
+            unsafe { opus_repacketizer_init(self.inner.rp.as_ptr()) };
+        }
+    }
+}
+
 impl Deref for RepacketizerRef<'_> {
     type Target = Repacketizer;
 
@@ -216,5 +370,40 @@ impl Deref for RepacketizerRef<'_> {
 impl DerefMut for RepacketizerRef<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+#[cfg(all(test, opus_codec_rust_packet_ops))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_cached_layout_falls_back_to_c_emit() {
+        let packet = vec![0x78, b'a'];
+        let mut rp = Repacketizer::new().unwrap();
+        rp.push_owned(packet.clone()).unwrap();
+        rp.packets[0].layout = Err(Error::InvalidPacket);
+
+        let mut out = [0u8; 8];
+        let out_len = rp.emit(&mut out).unwrap();
+        assert_eq!(&out[..out_len], packet);
+
+        let out_len = rp.emit_range(0, 1, &mut out).unwrap();
+        assert_eq!(&out[..out_len], packet);
+    }
+
+    #[test]
+    fn unexpected_cached_layout_error_is_not_hidden() {
+        let packet = vec![0x78, b'a'];
+        let mut rp = Repacketizer::new().unwrap();
+        rp.push_owned(packet).unwrap();
+        rp.packets[0].layout = Err(Error::InternalError);
+
+        let mut out = [0u8; 8];
+        assert_eq!(rp.emit(&mut out).unwrap_err(), Error::InternalError);
+        assert_eq!(
+            rp.emit_range(0, 1, &mut out).unwrap_err(),
+            Error::InternalError
+        );
     }
 }

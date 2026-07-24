@@ -23,6 +23,15 @@ impl<T> RawHandle<T> {
     }
 }
 
+pub(crate) fn checked_non_null<T>(ptr: *mut T, context: &str) -> NonNull<T> {
+    assert!(!ptr.is_null(), "{context} called with null ptr");
+    assert!(
+        crate::opus_ptr_is_aligned(ptr.cast()),
+        "{context} called with misaligned ptr"
+    );
+    NonNull::new(ptr).expect("pointer was checked for null")
+}
+
 impl<T> Drop for RawHandle<T> {
     fn drop(&mut self) {
         if self.ownership == Ownership::Owned {

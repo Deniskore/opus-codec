@@ -1,9 +1,7 @@
 //! Opus decoder implementation with safe wrappers
 
 #[cfg(feature = "dred")]
-use crate::bindings::{
-    OPUS_GET_DRED_DURATION_REQUEST, OPUS_SET_DNN_BLOB_REQUEST, OPUS_SET_DRED_DURATION_REQUEST,
-};
+use crate::bindings::OPUS_SET_DNN_BLOB_REQUEST;
 use crate::bindings::{
     OPUS_GET_FINAL_RANGE_REQUEST, OPUS_GET_GAIN_REQUEST, OPUS_GET_LAST_PACKET_DURATION_REQUEST,
     OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST, OPUS_GET_PITCH_REQUEST,
@@ -12,7 +10,7 @@ use crate::bindings::{
     opus_decoder_create, opus_decoder_ctl, opus_decoder_destroy, opus_decoder_get_nb_samples,
     opus_decoder_get_size, opus_decoder_init,
 };
-use crate::constants::max_frame_samples_for;
+use crate::constants::{is_frame_size_2_5ms_aligned, max_frame_samples_for};
 use crate::error::{Error, Result};
 use crate::packet;
 use crate::types::{Bandwidth, Channels, SampleRate};
@@ -30,7 +28,6 @@ pub struct Decoder {
 }
 
 unsafe impl Send for Decoder {}
-unsafe impl Sync for Decoder {}
 
 /// Borrowed wrapper around a decoder state.
 pub struct DecoderRef<'a> {
@@ -39,7 +36,6 @@ pub struct DecoderRef<'a> {
 }
 
 unsafe impl Send for DecoderRef<'_> {}
-unsafe impl Sync for DecoderRef<'_> {}
 
 impl Decoder {
     fn from_raw(
@@ -155,6 +151,12 @@ impl Decoder {
         if frame_size.get() > max_frame {
             return Err(Error::BadArg);
         }
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (input.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size.get(), self.sample_rate)
+        {
+            return Err(Error::BadArg);
+        }
 
         let input_len_i32 = if input.is_empty() {
             0
@@ -210,6 +212,12 @@ impl Decoder {
         if frame_size.get() > max_frame {
             return Err(Error::BadArg);
         }
+        // libopus requires PLC/FEC frame sizes to be multiples of 2.5 ms.
+        if (input.is_empty() || fec)
+            && !is_frame_size_2_5ms_aligned(frame_size.get(), self.sample_rate)
+        {
+            return Err(Error::BadArg);
+        }
 
         let input_len_i32 = if input.is_empty() {
             0
@@ -247,6 +255,9 @@ impl Decoder {
     /// overlong input, or a mapped libopus error.
     pub fn packet_samples(&self, packet: &[u8]) -> Result<usize> {
         // Errors: InvalidState or libopus error mapped.
+        if packet.is_empty() {
+            return Err(Error::BadArg);
+        }
         if packet.len() > i32::MAX as usize {
             return Err(Error::BadArg);
         }
@@ -393,22 +404,6 @@ impl Decoder {
     }
 
     #[cfg(feature = "dred")]
-    /// Set DRED duration in ms (if libopus built with DRED).
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus error.
-    pub fn set_dred_duration(&mut self, ms: i32) -> Result<()> {
-        self.simple_ctl(OPUS_SET_DRED_DURATION_REQUEST as i32, ms)
-    }
-    #[cfg(feature = "dred")]
-    /// Query DRED duration in ms.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus error.
-    pub fn dred_duration(&mut self) -> Result<i32> {
-        self.get_int_ctl(OPUS_GET_DRED_DURATION_REQUEST as i32)
-    }
-    #[cfg(feature = "dred")]
     /// Set DNN blob for DRED (feature-gated; will error if unsupported).
     ///
     /// # Safety
@@ -459,8 +454,15 @@ impl<'a> DecoderRef<'a> {
     /// # Safety
     /// - `ptr` must point to valid, initialized memory of at least [`Decoder::size()`] bytes
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sample_rate` and `channels` must exactly match the decoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes against the wrong channel/rate and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned.
     ///
     /// Use [`Decoder::init_in_place`] to initialize the memory before calling this.
     #[must_use]
@@ -469,10 +471,8 @@ impl<'a> DecoderRef<'a> {
         sample_rate: SampleRate,
         channels: Channels,
     ) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
         let decoder = Decoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, "DecoderRef::from_raw"),
             sample_rate,
             channels,
             Ownership::Borrowed,

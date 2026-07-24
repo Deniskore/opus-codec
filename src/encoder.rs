@@ -17,6 +17,8 @@ use crate::bindings::{
     opus_encode, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
     opus_encoder_get_size, opus_encoder_init,
 };
+#[cfg(feature = "dred")]
+use crate::bindings::{OPUS_GET_DRED_DURATION_REQUEST, OPUS_SET_DRED_DURATION_REQUEST};
 use crate::constants::max_frame_samples_for;
 use crate::error::{Error, Result};
 use crate::types::{
@@ -36,7 +38,6 @@ pub struct Encoder {
 }
 
 unsafe impl Send for Encoder {}
-unsafe impl Sync for Encoder {}
 
 /// Borrowed wrapper around an encoder state.
 pub struct EncoderRef<'a> {
@@ -45,7 +46,6 @@ pub struct EncoderRef<'a> {
 }
 
 unsafe impl Send for EncoderRef<'_> {}
-unsafe impl Sync for EncoderRef<'_> {}
 
 impl Encoder {
     fn from_raw(
@@ -198,7 +198,9 @@ impl Encoder {
 
     /// Encode 16-bit PCM, capping output to `max_data_bytes`.
     ///
-    /// Note: This does not itself enable FEC; use `set_inband_fec(true)` and
+    /// This uses the normal libopus `opus_encode` path and passes `max_data_bytes`
+    /// as the output limit, so it constrains packet size without enabling a separate
+    /// encoder mode. It does not itself enable FEC; use `set_inband_fec(true)` and
     /// `set_packet_loss_perc(…)` to actually make the encoder produce FEC.
     ///
     /// # Errors
@@ -448,7 +450,7 @@ impl Encoder {
         }
     }
 
-    /// Encoder algorithmic lookahead (in samples at 48 kHz domain).
+    /// Encoder algorithmic lookahead in samples at this encoder's configured sample rate.
     ///
     /// # Errors
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
@@ -557,6 +559,27 @@ impl Encoder {
     /// Returns [`Error::InvalidState`] if the encoder is invalid, or a mapped libopus error.
     pub fn phase_inversion_disabled(&mut self) -> Result<bool> {
         self.get_bool_ctl(OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST as i32)
+    }
+
+    #[cfg(feature = "dred")]
+    /// Set the maximum number of 10-ms Deep Redundancy (DRED) frames.
+    ///
+    /// A value of zero disables DRED. Libopus validates the supported upper bound.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] if `frames_10ms` is outside the supported range, or a mapped
+    /// libopus error if DRED is unavailable in the linked encoder.
+    pub fn set_dred_duration(&mut self, frames_10ms: i32) -> Result<()> {
+        self.simple_ctl(OPUS_SET_DRED_DURATION_REQUEST as i32, frames_10ms)
+    }
+
+    #[cfg(feature = "dred")]
+    /// Query the configured maximum number of 10-ms DRED frames.
+    ///
+    /// # Errors
+    /// Returns a mapped libopus error if the encoder is invalid or DRED is unavailable.
+    pub fn dred_duration(&mut self) -> Result<i32> {
+        self.get_int_ctl(OPUS_GET_DRED_DURATION_REQUEST as i32)
     }
 
     // --- internal helpers ---
@@ -674,9 +697,8 @@ impl Encoder {
             return Err(Error::from_code(result));
         }
 
-        Ok(Complexity::new(
-            u32::try_from(complexity).map_err(|_| Error::InternalError)?,
-        ))
+        let complexity = u32::try_from(complexity).map_err(|_| Error::InternalError)?;
+        Complexity::try_new(complexity).ok_or(Error::InternalError)
     }
 
     /// Enable or disable VBR.
@@ -744,8 +766,15 @@ impl<'a> EncoderRef<'a> {
     /// # Safety
     /// - `ptr` must point to valid, initialized memory of at least [`Encoder::size()`] bytes
     /// - `ptr` must be aligned to at least `align_of::<usize>()` (malloc-style alignment)
+    /// - `sample_rate` and `channels` must exactly match the encoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    ///
+    /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
+    /// sizes against the wrong channel/rate and then call libopus with out-of-bounds buffers.
+    ///
+    /// # Panics
+    /// Panics if `ptr` is null or not pointer-aligned.
     ///
     /// Use [`Encoder::init_in_place`] to initialize the memory before calling this.
     #[must_use]
@@ -754,10 +783,8 @@ impl<'a> EncoderRef<'a> {
         sample_rate: SampleRate,
         channels: Channels,
     ) -> Self {
-        debug_assert!(!ptr.is_null(), "from_raw called with null ptr");
-        debug_assert!(crate::opus_ptr_is_aligned(ptr.cast()));
         let encoder = Encoder::from_raw(
-            unsafe { NonNull::new_unchecked(ptr) },
+            crate::checked_non_null(ptr, "EncoderRef::from_raw"),
             sample_rate,
             channels,
             Ownership::Borrowed,

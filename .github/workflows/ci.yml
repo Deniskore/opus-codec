@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -11,7 +14,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: cargo fmt
@@ -21,7 +24,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: cargo clippy
@@ -31,7 +34,7 @@ jobs:
     name: Cargo Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: cargo check
@@ -41,7 +44,7 @@ jobs:
     name: MSRV Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.87.0
       - name: cargo check
@@ -53,9 +56,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-2025-vs2026]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install ffmpeg (Ubuntu)
@@ -67,18 +70,39 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: brew install ffmpeg
       - name: Install ffmpeg (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(matrix.os, 'windows-')
         shell: pwsh
         run: choco install ffmpeg --no-progress -y
       - name: cargo test
         run: cargo test
+
+  windows-static-crt:
+    name: Windows Static CRT
+    runs-on: windows-2025-vs2026
+    env:
+      CARGO_TARGET_DIR: target/ci-windows-static-crt
+      CRT_VERIFY_TARGET: x86_64-pc-windows-msvc
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install ffmpeg
+        shell: pwsh
+        run: choco install ffmpeg --no-progress -y
+      - name: Verify static CRT imports
+        run: python scripts/verify_windows_static_crt.py
+      - name: cargo test (static CRT)
+        run: cargo test --target x86_64-pc-windows-msvc
 
   avx-presume:
     name: AVX presume feature
     runs-on: ubuntu-latest
     needs: [fmt, clippy, check, tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Verify AVX presume gating
@@ -88,23 +112,73 @@ jobs:
     name: System Library
     runs-on: ubuntu-latest
     needs: [fmt, clippy, check, tests]
+    env:
+      CARGO_TARGET_DIR: target/ci-system-lib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config ffmpeg curl build-essential autoconf automake libtool cmake
+          sudo apt-get install -y build-essential cmake pkg-config ffmpeg
+      - name: Install pinned Opus system library
+        env:
+          OPUS_SYSTEM_BUILD_DIR: ${{ runner.temp }}/opus-system-build
+          OPUS_SYSTEM_PREFIX: ${{ runner.temp }}/opus-system
+        run: |
+          # The git subtree has no standalone metadata for CMake to derive its release version.
+          cmake \
+            -S opus \
+            -B "$OPUS_SYSTEM_BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$OPUS_SYSTEM_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DOPUS_PACKAGE_VERSION=1.5.2 \
+            -DOPUS_BUILD_SHARED_LIBRARY=OFF \
+            -DOPUS_BUILD_TESTING=OFF \
+            -DOPUS_BUILD_PROGRAMS=OFF \
+            -DOPUS_DRED=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build "$OPUS_SYSTEM_BUILD_DIR" --parallel
+          cmake --install "$OPUS_SYSTEM_BUILD_DIR"
       - name: Verify system lib build and tests
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/opus-system/lib/pkgconfig
         run: python scripts/verify_system_lib.py
+
+  asan:
+    name: ASan + LeakSanitizer (bundled)
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      CARGO_TARGET_DIR: target/ci-asan
+      CC: clang
+      CFLAGS: -fsanitize=address -fno-omit-frame-pointer
+      RUSTFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install sanitizer test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm ffmpeg wget
+      - name: Test Rust and bundled C with ASan and leak detection
+        run: >-
+          cargo +nightly test
+          --target x86_64-unknown-linux-gnu
+          --features dred
+          --all-targets
 
   dred:
     name: DRED (bundled)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, check, tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install deps (ffmpeg + wget for model download)

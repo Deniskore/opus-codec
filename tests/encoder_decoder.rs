@@ -53,6 +53,13 @@ fn test_buffer_empty() {
 }
 
 #[test]
+fn test_packet_samples_rejects_empty_packet() {
+    let decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+    let result = decoder.packet_samples(&[]);
+    assert_eq!(result, Err(Error::BadArg));
+}
+
+#[test]
 fn test_init_in_place_alignment_checks() {
     let sr = SampleRate::Hz48000;
     let channels = Channels::Mono;
