@@ -49,6 +49,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.87.0
       - name: cargo check
         run: cargo check --all-targets
+      - name: cargo check (DRED/external weights)
+        run: cargo check --all-targets --features external-weights
 
   tests:
     name: Tests
@@ -166,6 +168,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm ffmpeg wget
+      - name: Test external DNN weights end to end
+        env:
+          CARGO_TARGET_DIR: target/ci-asan-external-weights
+        run: >-
+          python scripts/verify_external_weights.py
+          --toolchain nightly
+          --target x86_64-unknown-linux-gnu
       - name: Test Rust and bundled C with ASan and leak detection
         run: >-
           cargo +nightly test

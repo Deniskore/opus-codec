@@ -85,8 +85,9 @@ fn every_single_stream_ctl_is_supported_by_bundled_opus() {
             Ok(())
         }),
         ("lsb_depth", |encoder| {
+            assert_eq!(encoder.set_lsb_depth(7), Err(Error::BadArg));
             encoder.set_lsb_depth(16)?;
-            let _ = encoder.lsb_depth()?;
+            assert_eq!(encoder.lsb_depth()?, 16);
             Ok(())
         }),
         ("expert_frame_duration", |encoder| {
@@ -165,6 +166,11 @@ fn every_multistream_ctl_is_supported_by_bundled_opus() {
         ("complexity", |encoder| {
             encoder.set_complexity(Complexity::new(5))?;
             let _ = encoder.complexity()?;
+            Ok(())
+        }),
+        ("lsb_depth", |encoder| {
+            encoder.set_lsb_depth(16)?;
+            let _ = encoder.lsb_depth()?;
             Ok(())
         }),
         ("dtx", |encoder| {
@@ -305,6 +311,10 @@ fn every_dred_ctl_uses_the_bundled_opus_signature() {
         Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
     encoder.set_dred_duration(2).unwrap();
     assert_eq!(encoder.dred_duration().unwrap(), 2);
+    assert_eq!(
+        unsafe { encoder.set_dnn_blob(std::ptr::null(), 0) },
+        Err(Error::BadArg)
+    );
 
     let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     assert_eq!(

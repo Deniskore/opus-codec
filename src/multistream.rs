@@ -6,7 +6,7 @@ use crate::bindings::{
     OPUS_GET_BANDWIDTH_REQUEST, OPUS_GET_BITRATE_REQUEST, OPUS_GET_COMPLEXITY_REQUEST,
     OPUS_GET_DTX_REQUEST, OPUS_GET_FINAL_RANGE_REQUEST, OPUS_GET_FORCE_CHANNELS_REQUEST,
     OPUS_GET_GAIN_REQUEST, OPUS_GET_IN_DTX_REQUEST, OPUS_GET_INBAND_FEC_REQUEST,
-    OPUS_GET_LAST_PACKET_DURATION_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST,
+    OPUS_GET_LAST_PACKET_DURATION_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST, OPUS_GET_LSB_DEPTH_REQUEST,
     OPUS_GET_MAX_BANDWIDTH_REQUEST, OPUS_GET_PACKET_LOSS_PERC_REQUEST,
     OPUS_GET_PHASE_INVERSION_DISABLED_REQUEST, OPUS_GET_PITCH_REQUEST,
     OPUS_GET_SAMPLE_RATE_REQUEST, OPUS_GET_SIGNAL_REQUEST, OPUS_GET_VBR_CONSTRAINT_REQUEST,
@@ -14,7 +14,7 @@ use crate::bindings::{
     OPUS_MULTISTREAM_GET_ENCODER_STATE_REQUEST, OPUS_RESET_STATE, OPUS_SET_BANDWIDTH_REQUEST,
     OPUS_SET_BITRATE_REQUEST, OPUS_SET_COMPLEXITY_REQUEST, OPUS_SET_DTX_REQUEST,
     OPUS_SET_FORCE_CHANNELS_REQUEST, OPUS_SET_GAIN_REQUEST, OPUS_SET_INBAND_FEC_REQUEST,
-    OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+    OPUS_SET_LSB_DEPTH_REQUEST, OPUS_SET_MAX_BANDWIDTH_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
     OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, OPUS_SET_SIGNAL_REQUEST,
     OPUS_SET_VBR_CONSTRAINT_REQUEST, OPUS_SET_VBR_REQUEST, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE,
     OpusDecoder, OpusEncoder, OpusMSDecoder, OpusMSEncoder, opus_decoder_ctl, opus_encoder_ctl,
@@ -32,7 +32,7 @@ use crate::types::{Application, Bandwidth, Bitrate, Channels, Complexity, Sample
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
 use std::num::{NonZeroU8, NonZeroUsize};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::NonNull;
 
 /// Describes the multistream mapping configuration.
@@ -220,6 +220,18 @@ pub struct MultistreamEncoder {
 unsafe impl Send for MultistreamEncoder {}
 
 /// Borrowed wrapper around a multistream encoder.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::multistream::{MultistreamEncoder, MultistreamEncoderRef};
+/// fn extract<'a>(
+///     state: &mut MultistreamEncoderRef<'a>,
+///     replacement: MultistreamEncoder,
+/// ) -> MultistreamEncoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct MultistreamEncoderRef<'a> {
     inner: MultistreamEncoder,
     _marker: PhantomData<&'a mut OpusMSEncoder>,
@@ -767,6 +779,26 @@ impl MultistreamEncoder {
         self.get_int_ctl(OPUS_GET_LOOKAHEAD_REQUEST as i32)
     }
 
+    /// Set the effective input signal depth in bits.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] when `bits` is outside `8..=24`,
+    /// [`Error::InvalidState`] if the encoder handle is null, or a mapped libopus error.
+    pub fn set_lsb_depth(&mut self, bits: i32) -> Result<()> {
+        if !(8..=24).contains(&bits) {
+            return Err(Error::BadArg);
+        }
+        self.simple_ctl(OPUS_SET_LSB_DEPTH_REQUEST as i32, bits)
+    }
+
+    /// Query the effective input signal depth in bits.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidState`] if the encoder handle is null or a mapped libopus error.
+    pub fn lsb_depth(&mut self) -> Result<i32> {
+        self.get_int_ctl(OPUS_GET_LSB_DEPTH_REQUEST as i32)
+    }
+
     /// Reset the encoder state (retaining configuration).
     ///
     /// # Errors
@@ -1021,6 +1053,43 @@ impl<'a> MultistreamEncoderRef<'a> {
         };
         Ok((encoder, mapping))
     }
+
+    delegate_ref_mut_methods! {
+        fn encode(pcm: &[i16], frame_size_per_ch: usize, out: &mut [u8]) -> Result<usize>;
+        fn encode_float(pcm: &[f32], frame_size_per_ch: usize, out: &mut [u8]) -> Result<usize>;
+        fn final_range() -> Result<u32>;
+        fn set_bitrate(bitrate: Bitrate) -> Result<()>;
+        fn bitrate() -> Result<Bitrate>;
+        fn set_complexity(complexity: Complexity) -> Result<()>;
+        fn complexity() -> Result<Complexity>;
+        fn set_dtx(enabled: bool) -> Result<()>;
+        fn dtx() -> Result<bool>;
+        fn in_dtx() -> Result<bool>;
+        fn set_inband_fec(enabled: bool) -> Result<()>;
+        fn inband_fec() -> Result<bool>;
+        fn set_packet_loss_perc(perc: i32) -> Result<()>;
+        fn packet_loss_perc() -> Result<i32>;
+        fn set_vbr(enabled: bool) -> Result<()>;
+        fn vbr() -> Result<bool>;
+        fn set_vbr_constraint(constrained: bool) -> Result<()>;
+        fn vbr_constraint() -> Result<bool>;
+        fn set_max_bandwidth(bw: Bandwidth) -> Result<()>;
+        fn max_bandwidth() -> Result<Bandwidth>;
+        fn set_bandwidth(bw: Bandwidth) -> Result<()>;
+        fn bandwidth() -> Result<Bandwidth>;
+        fn set_force_channels(channels: Option<Channels>) -> Result<()>;
+        fn force_channels() -> Result<Option<Channels>>;
+        fn set_signal(signal: Signal) -> Result<()>;
+        fn signal() -> Result<Signal>;
+        fn lookahead() -> Result<i32>;
+        fn set_lsb_depth(bits: i32) -> Result<()>;
+        fn lsb_depth() -> Result<i32>;
+        fn reset() -> Result<()>;
+    }
+
+    delegate_ref_unsafe_mut_methods! {
+        unsafe fn encoder_state_ptr(stream_index: i32) -> Result<*mut OpusEncoder>;
+    }
 }
 
 impl Deref for MultistreamEncoderRef<'_> {
@@ -1028,12 +1097,6 @@ impl Deref for MultistreamEncoderRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for MultistreamEncoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
@@ -1047,6 +1110,18 @@ pub struct MultistreamDecoder {
 unsafe impl Send for MultistreamDecoder {}
 
 /// Borrowed wrapper around a multistream decoder.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::multistream::{MultistreamDecoder, MultistreamDecoderRef};
+/// fn extract<'a>(
+///     state: &mut MultistreamDecoderRef<'a>,
+///     replacement: MultistreamDecoder,
+/// ) -> MultistreamDecoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct MultistreamDecoderRef<'a> {
     inner: MultistreamDecoder,
     _marker: PhantomData<&'a mut OpusMSDecoder>,
@@ -1507,6 +1582,24 @@ impl<'a> MultistreamDecoderRef<'a> {
         unsafe { MultistreamDecoder::init_in_place(ptr, sr, mapping)? };
         Ok(unsafe { Self::from_raw(ptr, sr, mapping) })
     }
+
+    delegate_ref_mut_methods! {
+        fn decode(packet: &[u8], out: &mut [i16], frame_size_per_ch: usize, fec: bool) -> Result<usize>;
+        fn decode_float(packet: &[u8], out: &mut [f32], frame_size_per_ch: usize, fec: bool) -> Result<usize>;
+        fn final_range() -> Result<u32>;
+        fn reset() -> Result<()>;
+        fn set_gain(q8_db: i32) -> Result<()>;
+        fn gain() -> Result<i32>;
+        fn set_phase_inversion_disabled(disabled: bool) -> Result<()>;
+        fn phase_inversion_disabled() -> Result<bool>;
+        fn get_sample_rate() -> Result<i32>;
+        fn get_pitch() -> Result<i32>;
+        fn get_last_packet_duration() -> Result<i32>;
+    }
+
+    delegate_ref_unsafe_mut_methods! {
+        unsafe fn decoder_state_ptr(stream_index: i32) -> Result<*mut OpusDecoder>;
+    }
 }
 
 impl Deref for MultistreamDecoderRef<'_> {
@@ -1514,12 +1607,6 @@ impl Deref for MultistreamDecoderRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for MultistreamDecoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 

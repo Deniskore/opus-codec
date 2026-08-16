@@ -11,7 +11,8 @@ Safe Rust wrappers around libopus for encoding/decoding Opus audio, with tests t
 ## Features
 
 - `presume-avx2`: Build the bundled libopus with `OPUS_X86_PRESUME_AVX2` on x86/x86_64 targets, assuming AVX/AVX2/FMA support. Ignored when linking against a system libopus.
-- `dred`: Enable libopus DRED support (downloads the model when building the bundled library). The bundled DRED build currently assumes a Unix-like host with `sh`, `wget`, and `tar`, it is not supported on Windows.
+- `dred`: Enable libopus DRED support (downloads the model when building the bundled library). The bundled DRED build currently assumes a Unix-like host with `sh`, `tar`, and either `wget` or `curl`, it is not supported on Windows.
+- `external-weights`: Enable DRED with runtime-loaded DNN weights instead of embedded weights. This implies `dred` and builds bundled libopus with `USE_WEIGHTS_FILE`. With `system-lib`, the installed libopus must already support external weights.
 - `system-lib`: Link against a system-provided libopus instead of the bundled sources.
 
 ## MSRV

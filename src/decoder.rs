@@ -17,21 +17,54 @@ use crate::types::{Bandwidth, Channels, SampleRate};
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::{self, NonNull};
+
+#[cfg(feature = "dred")]
+struct RetainedDnnBlob {
+    data: Box<[u32]>,
+    len: i32,
+}
+
+#[cfg(feature = "dred")]
+impl RetainedDnnBlob {
+    fn parts(&self) -> (*const u8, i32) {
+        (self.data.as_ptr().cast::<u8>(), self.len)
+    }
+}
 
 /// Safe wrapper around a libopus `OpusDecoder`.
 pub struct Decoder {
     raw: RawHandle<OpusDecoder>,
     sample_rate: SampleRate,
     channels: Channels,
+    // External-weight builds retain pointers into DNN blobs. Keep each copy,
+    // including copies used by failed non-transactional load attempts, until
+    // after the C decoder has been destroyed. Field declaration order makes
+    // `raw` drop before this storage.
+    #[cfg(feature = "dred")]
+    dnn_blobs: Vec<RetainedDnnBlob>,
+    #[cfg(feature = "dred")]
+    active_dnn_blob: Option<usize>,
 }
 
 unsafe impl Send for Decoder {}
 
 /// Borrowed wrapper around a decoder state.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::decoder::DecoderRef;
+/// use opus_codec::Decoder;
+/// fn extract<'a>(state: &mut DecoderRef<'a>, replacement: Decoder) -> Decoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct DecoderRef<'a> {
     inner: Decoder,
+    #[cfg(feature = "dred")]
+    active_dnn_blob: Option<(*const u8, i32)>,
     _marker: PhantomData<&'a mut OpusDecoder>,
 }
 
@@ -48,6 +81,10 @@ impl Decoder {
             raw: RawHandle::new(ptr, ownership, opus_decoder_destroy),
             sample_rate,
             channels,
+            #[cfg(feature = "dred")]
+            dnn_blobs: Vec::new(),
+            #[cfg(feature = "dred")]
+            active_dnn_blob: None,
         }
     }
 
@@ -306,6 +343,8 @@ impl Decoder {
             return Err(Error::from_code(result));
         }
 
+        #[cfg(feature = "dred")]
+        self.reload_active_dnn_blob()?;
         Ok(())
     }
 
@@ -407,15 +446,48 @@ impl Decoder {
     /// Set DNN blob for DRED (feature-gated; will error if unsupported).
     ///
     /// # Safety
-    /// Caller must ensure `ptr` is valid for reads as expected by libopus for the duration of the call
-    /// and points to a properly formatted DNN blob. Passing an invalid or dangling pointer is UB.
+    /// `ptr` must be valid for reads of `len` bytes for the duration of this call and point to a
+    /// complete, correctly formatted libopus DNN blob. The bytes are copied into aligned storage
+    /// owned by the decoder, so the caller's allocation need not remain alive after this returns.
+    /// Some external-weight libopus builds do not safely handle malformed model records.
     ///
     /// # Errors
-    /// Returns [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus error.
+    /// Returns [`Error::BadArg`] if `ptr` is null or `len` is non-positive,
+    /// [`Error::InvalidState`] if the decoder is invalid, or a mapped libopus error.
     pub unsafe fn set_dnn_blob(&mut self, ptr: *const u8, len: i32) -> Result<()> {
+        let blob_index = unsafe { self.retain_dnn_blob_copy(ptr, len)? };
+        let (owned_ptr, owned_len) = self.dnn_blobs[blob_index].parts();
+        if let Err(error) = unsafe { self.apply_dnn_blob(owned_ptr, owned_len) } {
+            if error == Error::Unimplemented {
+                // An unsupported CTL never inspected or retained the pointer.
+                // Other failures may leave model fields pointing into the blob.
+                let removed = self.dnn_blobs.pop();
+                debug_assert!(removed.is_some());
+            }
+            return Err(error);
+        }
+        self.active_dnn_blob = Some(blob_index);
+        Ok(())
+    }
+
+    #[cfg(feature = "dred")]
+    unsafe fn retain_dnn_blob_copy(&mut self, ptr: *const u8, len: i32) -> Result<usize> {
         if ptr.is_null() || len <= 0 {
             return Err(Error::BadArg);
         }
+        let byte_len = usize::try_from(len).map_err(|_| Error::BadArg)?;
+        let word_len = byte_len.div_ceil(std::mem::size_of::<u32>());
+        let mut blob = vec![0u32; word_len].into_boxed_slice();
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, blob.as_mut_ptr().cast::<u8>(), byte_len);
+        }
+        let index = self.dnn_blobs.len();
+        self.dnn_blobs.push(RetainedDnnBlob { data: blob, len });
+        Ok(index)
+    }
+
+    #[cfg(feature = "dred")]
+    unsafe fn apply_dnn_blob(&mut self, ptr: *const u8, len: i32) -> Result<()> {
         let r = unsafe {
             opus_decoder_ctl(
                 self.raw.as_ptr(),
@@ -428,6 +500,15 @@ impl Decoder {
             return Err(Error::from_code(r));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "dred")]
+    fn reload_active_dnn_blob(&mut self) -> Result<()> {
+        let Some(index) = self.active_dnn_blob else {
+            return Ok(());
+        };
+        let (ptr, len) = self.dnn_blobs[index].parts();
+        unsafe { self.apply_dnn_blob(ptr, len) }
     }
 
     // --- internal helpers for CTLs ---
@@ -457,6 +538,8 @@ impl<'a> DecoderRef<'a> {
     /// - `sample_rate` and `channels` must exactly match the decoder state already stored at `ptr`
     /// - The memory must remain valid for the lifetime `'a`
     /// - Caller is responsible for freeing the memory after this wrapper is dropped
+    /// - If the external state already uses runtime-loaded DNN weights, register that blob again
+    ///   through `DecoderRef::set_dnn_blob` before calling `DecoderRef::reset`
     ///
     /// Passing mismatched metadata is undefined behavior: later safe methods may validate buffer
     /// sizes against the wrong channel/rate and then call libopus with out-of-bounds buffers.
@@ -479,6 +562,8 @@ impl<'a> DecoderRef<'a> {
         );
         Self {
             inner: decoder,
+            #[cfg(feature = "dred")]
+            active_dnn_blob: None,
             _marker: PhantomData,
         }
     }
@@ -500,6 +585,57 @@ impl<'a> DecoderRef<'a> {
         unsafe { Decoder::init_in_place(ptr, sample_rate, channels)? };
         Ok(unsafe { Self::from_raw(ptr, sample_rate, channels) })
     }
+
+    delegate_ref_mut_methods! {
+        fn decode(input: &[u8], output: &mut [i16], fec: bool) -> Result<usize>;
+        fn decode_float(input: &[u8], output: &mut [f32], fec: bool) -> Result<usize>;
+        fn get_sample_rate() -> Result<i32>;
+        fn get_pitch() -> Result<i32>;
+        fn get_last_packet_duration() -> Result<i32>;
+        fn final_range() -> Result<u32>;
+        fn set_gain(q8_db: i32) -> Result<()>;
+        fn gain() -> Result<i32>;
+        fn phase_inversion_disabled() -> Result<bool>;
+        fn set_phase_inversion_disabled(disabled: bool) -> Result<()>;
+    }
+
+    /// Reset the decoder and restore the last successfully registered external DNN model.
+    ///
+    /// # Errors
+    /// Returns a mapped libopus error if the reset or model restoration fails.
+    pub fn reset(&mut self) -> Result<()> {
+        self.inner.reset()?;
+        #[cfg(feature = "dred")]
+        if let Some((ptr, len)) = self.active_dnn_blob {
+            unsafe { self.inner.apply_dnn_blob(ptr, len)? };
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "dred")]
+    /// Load an external DNN blob into this borrowed decoder state.
+    ///
+    /// Unlike [`Decoder::set_dnn_blob`], a borrowed wrapper cannot attach owned storage to the
+    /// external state. This method therefore passes the caller's allocation directly to libopus.
+    ///
+    /// # Safety
+    /// - `ptr` must point to `len` readable bytes containing a complete, correctly formatted
+    ///   libopus DNN blob, and must be aligned to at least `align_of::<u32>()`.
+    /// - The allocation must remain fixed and readable until the external decoder state is
+    ///   destroyed or will never be used again, even if this method returns an error. Dropping
+    ///   this Rust wrapper alone does not end that requirement.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] for invalid pointer metadata or alignment, or a mapped libopus
+    /// error when loading fails.
+    pub unsafe fn set_dnn_blob(&mut self, ptr: *const u8, len: i32) -> Result<()> {
+        if ptr.is_null() || len <= 0 || !ptr.addr().is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(Error::BadArg);
+        }
+        unsafe { self.inner.apply_dnn_blob(ptr, len)? };
+        self.active_dnn_blob = Some((ptr, len));
+        Ok(())
+    }
 }
 
 impl Deref for DecoderRef<'_> {
@@ -510,8 +646,26 @@ impl Deref for DecoderRef<'_> {
     }
 }
 
-impl DerefMut for DecoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+#[cfg(all(test, feature = "dred"))]
+mod tests {
+    use super::*;
+    use crate::types::{Channels, SampleRate};
+
+    #[test]
+    fn dnn_blob_is_copied_into_retained_aligned_storage() {
+        let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let source = [0u8, 1, 2, 3, 4];
+        let unaligned = unsafe { source.as_ptr().add(1) };
+
+        let index = unsafe { decoder.retain_dnn_blob_copy(unaligned, 4) }.unwrap();
+        let (retained, len) = decoder.dnn_blobs[index].parts();
+
+        assert_eq!(len, 4);
+        assert_eq!((retained as usize) % std::mem::align_of::<u32>(), 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(retained, 4) },
+            &source[1..]
+        );
+        assert_eq!(decoder.dnn_blobs.len(), 1);
     }
 }
