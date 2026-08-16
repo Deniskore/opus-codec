@@ -24,6 +24,7 @@ const BUNDLED_PACKET_OPS_FINGERPRINTS: &[SourceFingerprint] = &[
 struct BuildOptions {
     use_system_lib: bool,
     dred_enabled: bool,
+    external_weights: bool,
     presume_avx: bool,
     target_arch: String,
     avx_allowed: bool,
@@ -34,6 +35,7 @@ impl BuildOptions {
     fn from_env() -> Self {
         let use_system_lib = env::var("CARGO_FEATURE_SYSTEM_LIB").is_ok();
         let dred_enabled = env::var("CARGO_FEATURE_DRED").is_ok();
+        let external_weights = env::var("CARGO_FEATURE_EXTERNAL_WEIGHTS").is_ok();
         let presume_avx = env::var("CARGO_FEATURE_PRESUME_AVX2").is_ok();
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let avx_allowed = presume_avx && matches!(target_arch.as_str(), "x86" | "x86_64");
@@ -42,6 +44,7 @@ impl BuildOptions {
         Self {
             use_system_lib,
             dred_enabled,
+            external_weights,
             presume_avx,
             target_arch,
             avx_allowed,
@@ -128,6 +131,7 @@ fn emit_rerun_directives() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=opus/opus_data-735117b.tar.gz");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_LIB");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTERNAL_WEIGHTS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PRESUME_AVX2");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FAMILY");
@@ -138,6 +142,11 @@ fn handle_system_lib(opts: &BuildOptions) {
     if opts.dred_enabled {
         println!(
             "cargo:warning=system-lib feature enabled; ensure the system libopus includes DRED support"
+        );
+    }
+    if opts.external_weights {
+        println!(
+            "cargo:warning=external-weights cannot configure a system libopus; ensure it was built with USE_WEIGHTS_FILE"
         );
     }
     if opts.presume_avx {
@@ -196,6 +205,10 @@ fn build_bundled(opts: &BuildOptions, opus_source: &Path) -> std::path::PathBuf 
         config
             .define("OPUS_X86_PRESUME_AVX2", "ON")
             .define("OPUS_X86_MAY_HAVE_AVX2", "ON");
+    }
+
+    if opts.external_weights {
+        config.cflag("-DUSE_WEIGHTS_FILE");
     }
 
     config.build()
@@ -369,6 +382,40 @@ fn should_skip_dred_generated_path(path: &Path) -> bool {
     ) || rel.starts_with("dnn/models/")
 }
 
+fn download_dred_archive(archive_path: &Path, url: &str) {
+    use std::process::Command;
+
+    let mut failures = Vec::new();
+    let wget = Command::new("wget")
+        .arg("-O")
+        .arg(archive_path)
+        .arg(url)
+        .status();
+    match wget {
+        Ok(status) if status.success() => return,
+        Ok(status) => failures.push(format!("wget exited with {status}")),
+        Err(err) => failures.push(format!("wget could not be started: {err}")),
+    }
+
+    let curl = Command::new("curl")
+        .arg("--fail")
+        .arg("--location")
+        .arg("--output")
+        .arg(archive_path)
+        .arg(url)
+        .status();
+    match curl {
+        Ok(status) if status.success() => return,
+        Ok(status) => failures.push(format!("curl exited with {status}")),
+        Err(err) => failures.push(format!("curl could not be started: {err}")),
+    }
+
+    panic!(
+        "failed to download DRED model archive with wget or curl: {}",
+        failures.join("; ")
+    );
+}
+
 fn ensure_dred_assets(opus_source: &Path, out_dir: &Path) {
     use std::path::Component;
     use std::process::Command;
@@ -393,18 +440,8 @@ fn ensure_dred_assets(opus_source: &Path, out_dir: &Path) {
         out_dir.join(MODEL_ARCHIVE)
     };
     if !archive_path.exists() {
-        let status = Command::new("wget")
-            .arg("-O")
-            .arg(&archive_path)
-            .arg(format!(
-                "https://media.xiph.org/opus/models/opus_data-{MODEL_REV}.tar.gz"
-            ))
-            .status()
-            .expect("failed to spawn wget for DRED model download");
-
-        if !status.success() {
-            panic!("downloading DRED model assets failed (exit status: {status})");
-        }
+        let url = format!("https://media.xiph.org/opus/models/opus_data-{MODEL_REV}.tar.gz");
+        download_dred_archive(&archive_path, &url);
     }
 
     let actual = sha256_hex(&archive_path);

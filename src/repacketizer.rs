@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::packet;
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::NonNull;
 
 /// Repackages Opus frames into packets.
@@ -28,6 +28,15 @@ struct RetainedPacket {
 unsafe impl Send for Repacketizer {}
 
 /// Borrowed wrapper around a repacketizer state.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::repacketizer::{Repacketizer, RepacketizerRef};
+/// fn extract<'a>(state: &mut RepacketizerRef<'a>, replacement: Repacketizer) -> Repacketizer {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct RepacketizerRef<'a> {
     inner: Repacketizer,
     _marker: PhantomData<&'a mut OpusRepacketizer>,
@@ -345,6 +354,14 @@ impl<'a> RepacketizerRef<'a> {
         unsafe { Repacketizer::init_in_place(ptr)? };
         Ok(unsafe { Self::from_raw(ptr) })
     }
+
+    delegate_ref_mut_methods! {
+        fn reset() -> ();
+        fn push(packet: &[u8]) -> Result<()>;
+        fn push_owned(packet: Vec<u8>) -> Result<()>;
+        fn emit_range(begin: i32, end: i32, out: &mut [u8]) -> Result<usize>;
+        fn emit(out: &mut [u8]) -> Result<usize>;
+    }
 }
 
 impl Drop for RepacketizerRef<'_> {
@@ -364,12 +381,6 @@ impl Deref for RepacketizerRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for RepacketizerRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 

@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::types::SampleRate;
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::NonNull;
 
 // libopus computes `100 * max_dred_samples / sampling_rate` in signed 32-bit math.
@@ -22,11 +22,25 @@ const MAX_SAFE_DRED_SAMPLES: usize = (i32::MAX as usize) / 100;
 /// Managed handle for libopus `OpusDREDDecoder`.
 pub struct DredDecoder {
     raw: RawHandle<OpusDREDDecoder>,
+    // External-weight builds retain pointers into DNN blobs. Keep each copy,
+    // including copies used by failed non-transactional load attempts, until
+    // after the C decoder has been destroyed. Field declaration order makes
+    // `raw` drop before this storage.
+    dnn_blobs: Vec<Box<[u32]>>,
 }
 
 unsafe impl Send for DredDecoder {}
 
 /// Borrowed wrapper around an externally allocated DRED decoder.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::dred::{DredDecoder, DredDecoderRef};
+/// fn extract<'a>(state: &mut DredDecoderRef<'a>, replacement: DredDecoder) -> DredDecoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct DredDecoderRef<'a> {
     inner: DredDecoder,
     _marker: PhantomData<&'a mut OpusDREDDecoder>,
@@ -38,6 +52,7 @@ impl DredDecoder {
     fn from_raw(ptr: NonNull<OpusDREDDecoder>, ownership: Ownership) -> Self {
         Self {
             raw: RawHandle::new(ptr, ownership, opus_dred_decoder_destroy),
+            dnn_blobs: Vec::new(),
         }
     }
 
@@ -103,35 +118,56 @@ impl DredDecoder {
     ///
     /// # Safety
     ///
-    /// - `data` must contain a complete, correctly formatted libopus DNN weights blob. Some
-    ///   external-weight libopus builds do not safely handle malformed model records.
-    /// - The backing allocation must remain at the same address and valid for reads until this
-    ///   decoder is dropped, even when this method returns an error. Libopus model layers may
-    ///   retain pointers into the blob and model loading is not guaranteed to be transactional.
+    /// `data` must contain a complete, correctly formatted libopus DNN weights blob. Some
+    /// external-weight libopus builds do not safely handle malformed model records. The bytes are
+    /// copied into aligned storage owned by the decoder, so the caller's allocation need not
+    /// remain alive after this returns.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BadArg`] for an empty, misaligned, or overlong blob,
+    /// Returns [`Error::BadArg`] for an empty or overlong blob,
     /// [`Error::Unimplemented`] when the linked libopus was not built for external model
     /// weights, or another mapped libopus error when loading fails.
     pub unsafe fn set_dnn_blob(&mut self, data: &[u8]) -> Result<()> {
-        if data.is_empty() || !(data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<i32>())
-        {
-            return Err(Error::BadArg);
-        }
-        let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
+        let (owned_ptr, len) = self.retain_dnn_blob_copy(data)?;
         let r = unsafe {
             opus_dred_decoder_ctl(
                 self.raw.as_ptr(),
                 OPUS_SET_DNN_BLOB_REQUEST as i32,
-                data.as_ptr(),
+                owned_ptr,
                 len,
             )
         };
         if r != 0 {
-            return Err(Error::from_code(r));
+            let error = Error::from_code(r);
+            if error == Error::Unimplemented {
+                // An unsupported CTL never inspected or retained the pointer.
+                // Other failures may leave model fields pointing into the blob.
+                let removed = self.dnn_blobs.pop();
+                debug_assert!(removed.is_some());
+            }
+            return Err(error);
         }
         Ok(())
+    }
+
+    fn retain_dnn_blob_copy(&mut self, data: &[u8]) -> Result<(*const u8, i32)> {
+        if data.is_empty() {
+            return Err(Error::BadArg);
+        }
+        let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
+        let word_len = data.len().div_ceil(std::mem::size_of::<u32>());
+        let mut blob = vec![0u32; word_len].into_boxed_slice();
+        let blob_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                blob.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(&*blob),
+            )
+        };
+        blob_bytes[..data.len()].copy_from_slice(data);
+        let owned_ptr = blob.as_ptr().cast::<u8>();
+        self.dnn_blobs.push(blob);
+        Ok((owned_ptr, len))
     }
 
     /// Parse DRED payload and update `state`.
@@ -290,6 +326,51 @@ impl<'a> DredDecoderRef<'a> {
         unsafe { DredDecoder::init_in_place(ptr)? };
         Ok(unsafe { Self::from_raw(ptr) })
     }
+
+    /// Borrow the raw external decoder pointer.
+    #[must_use]
+    pub fn as_mut_ptr(&mut self) -> *mut OpusDREDDecoder {
+        self.inner.as_mut_ptr()
+    }
+
+    delegate_ref_mut_methods! {
+        fn parse(state: &mut DredState, data: &[u8], max_dred_samples: usize, sampling_rate: SampleRate, dred_end: &mut i32, defer_processing: bool) -> Result<usize>;
+        fn process(src: &DredState, dst: &mut DredState) -> Result<()>;
+        fn decode_into_i16(decoder: &mut Decoder, state: &DredState, dred_offset: i32, pcm: &mut [i16]) -> Result<usize>;
+        fn decode_into_f32(decoder: &mut Decoder, state: &DredState, dred_offset: i32, pcm: &mut [f32]) -> Result<usize>;
+    }
+
+    /// Load an external DNN model blob into the borrowed DRED decoder state.
+    ///
+    /// # Safety
+    /// - `data` must contain a complete, correctly formatted libopus DNN weights blob and its
+    ///   backing allocation must be aligned to at least `align_of::<u32>()`.
+    /// - The allocation must remain fixed and readable until the external decoder state is
+    ///   destroyed or will never be used again, even if this method returns an error. Dropping
+    ///   this Rust wrapper alone does not end that requirement.
+    ///
+    /// # Errors
+    /// Returns [`Error::BadArg`] for an empty, misaligned, or overlong blob, or a mapped libopus
+    /// error when loading fails.
+    pub unsafe fn set_dnn_blob(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() || !(data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>())
+        {
+            return Err(Error::BadArg);
+        }
+        let len = i32::try_from(data.len()).map_err(|_| Error::BadArg)?;
+        let r = unsafe {
+            opus_dred_decoder_ctl(
+                self.inner.raw.as_ptr(),
+                OPUS_SET_DNN_BLOB_REQUEST as i32,
+                data.as_ptr(),
+                len,
+            )
+        };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
 }
 
 impl Deref for DredDecoderRef<'_> {
@@ -297,12 +378,6 @@ impl Deref for DredDecoderRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for DredDecoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
@@ -443,6 +518,23 @@ mod tests {
 
     #[cfg(not(opus_codec_system_lib))]
     #[test]
+    fn dnn_blob_is_copied_into_retained_aligned_storage() {
+        let mut decoder = DredDecoder::new().expect("create bundled DRED decoder");
+        let source = [0u8, 1, 2, 3, 4];
+
+        let (retained, len) = decoder.retain_dnn_blob_copy(&source[1..]).unwrap();
+
+        assert_eq!(len, 4);
+        assert_eq!((retained as usize) % std::mem::align_of::<u32>(), 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(retained, 4) },
+            &source[1..]
+        );
+        assert_eq!(decoder.dnn_blobs.len(), 1);
+    }
+
+    #[cfg(all(not(opus_codec_system_lib), not(feature = "external-weights")))]
+    #[test]
     fn typed_dnn_blob_ctl_has_checked_input_and_exact_abi() {
         let model_word = 0u32;
         let mut decoder = DredDecoder::new().expect("create bundled DRED decoder");
@@ -458,5 +550,6 @@ mod tests {
             unsafe { decoder.set_dnn_blob(aligned_blob) },
             Err(Error::Unimplemented)
         );
+        assert!(decoder.dnn_blobs.is_empty());
     }
 }

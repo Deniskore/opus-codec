@@ -149,9 +149,7 @@ pub fn soft_clip(
     if softclip_mem.len() < channels_usize {
         return Err(Error::BadArg);
     }
-    let needed_samples = frame_size_per_ch
-        .checked_mul(channels_usize)
-        .ok_or(Error::BadArg)?;
+    let needed_samples = checked_soft_clip_sample_count(frame_size_per_ch, channels_usize)?;
     if pcm.len() < needed_samples {
         return Err(Error::BadArg);
     }
@@ -165,6 +163,19 @@ pub fn soft_clip(
         );
     }
     Ok(())
+}
+
+fn checked_soft_clip_sample_count(frame_size_per_ch: usize, channels: usize) -> Result<usize> {
+    let needed_samples = frame_size_per_ch
+        .checked_mul(channels)
+        .ok_or(Error::BadArg)?;
+    // opus_pcm_soft_clip() evaluates N*C and all sample offsets in signed
+    // C `int` arithmetic. A larger Rust slice would therefore still make the
+    // C implementation overflow before it accessed the full slice.
+    if needed_samples > i32::MAX as usize {
+        return Err(Error::BadArg);
+    }
+    Ok(needed_samples)
 }
 
 /// Parse a packet into caller-provided frame storage.
@@ -203,6 +214,9 @@ pub fn packet_parse_into<'packet>(
         return Err(Error::from_code(n));
     }
     let count = usize::try_from(n).map_err(|_| Error::InternalError)?;
+    if count > MAX_FRAMES_PER_PACKET {
+        return Err(Error::InternalError);
+    }
     if count > frames.len() {
         return Err(Error::BufferTooSmall);
     }
@@ -228,14 +242,14 @@ pub fn packet_parse_into<'packet>(
         starts[i] = start;
         lengths[i] = size;
     }
+    let payload_offset = usize::try_from(payload_offset).map_err(|_| Error::InternalError)?;
+    if payload_offset > packet.len() {
+        return Err(Error::InvalidPacket);
+    }
     for i in 0..count {
         frames[i] = &packet[starts[i]..starts[i] + lengths[i]];
     }
-    Ok((
-        out_toc,
-        usize::try_from(payload_offset).map_err(|_| Error::InternalError)?,
-        count,
-    ))
+    Ok((out_toc, payload_offset, count))
 }
 
 /// Parse packet into frame slices. Returns `(toc, payload_offset, frames)`.
@@ -399,4 +413,22 @@ pub fn multistream_packet_unpad(packet: &mut [u8], len: usize, nb_streams: i32) 
         return Err(Error::from_code(n));
     }
     usize::try_from(n).map_err(|_| Error::InternalError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_clip_rejects_sample_products_that_overflow_c_int() {
+        let frame_size = i32::MAX as usize / 2 + 1;
+        assert_eq!(
+            checked_soft_clip_sample_count(frame_size, 2),
+            Err(Error::BadArg)
+        );
+        assert_eq!(
+            checked_soft_clip_sample_count(i32::MAX as usize, 1),
+            Ok(i32::MAX as usize)
+        );
+    }
 }

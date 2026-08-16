@@ -46,6 +46,7 @@ sha2 = "0.11.0"
 [features]
 default = []
 dred = []
+external-weights = ["dred"]
 system-lib = []
 presume-avx2 = []
 

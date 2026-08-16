@@ -16,7 +16,7 @@ use crate::types::{Application, Bitrate, SampleRate};
 use crate::{AlignedBuffer, Ownership, RawHandle};
 use std::marker::PhantomData;
 use std::num::{NonZeroU8, NonZeroUsize};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::NonNull;
 
 fn validate_channels(channels: u8) -> Result<()> {
@@ -55,6 +55,18 @@ pub struct ProjectionEncoder {
 unsafe impl Send for ProjectionEncoder {}
 
 /// Borrowed wrapper around a projection encoder state.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::projection::{ProjectionEncoder, ProjectionEncoderRef};
+/// fn extract<'a>(
+///     state: &mut ProjectionEncoderRef<'a>,
+///     replacement: ProjectionEncoder,
+/// ) -> ProjectionEncoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct ProjectionEncoderRef<'a> {
     inner: ProjectionEncoder,
     _marker: PhantomData<&'a mut OpusProjectionEncoder>,
@@ -470,6 +482,17 @@ impl<'a> ProjectionEncoderRef<'a> {
         };
         Ok(unsafe { Self::from_raw(ptr, sample_rate, channels, streams, coupled) })
     }
+
+    delegate_ref_mut_methods! {
+        fn encode(pcm: &[i16], frame_size_per_ch: usize, out: &mut [u8]) -> Result<usize>;
+        fn encode_float(pcm: &[f32], frame_size_per_ch: usize, out: &mut [u8]) -> Result<usize>;
+        fn set_bitrate(bitrate: Bitrate) -> Result<()>;
+        fn bitrate() -> Result<Bitrate>;
+        fn demixing_matrix_size() -> Result<i32>;
+        fn demixing_matrix_gain() -> Result<i32>;
+        fn write_demixing_matrix(out: &mut [u8]) -> Result<usize>;
+        fn demixing_matrix_bytes() -> Result<Vec<u8>>;
+    }
 }
 
 impl Deref for ProjectionEncoderRef<'_> {
@@ -477,12 +500,6 @@ impl Deref for ProjectionEncoderRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for ProjectionEncoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
@@ -498,6 +515,18 @@ pub struct ProjectionDecoder {
 unsafe impl Send for ProjectionDecoder {}
 
 /// Borrowed wrapper around a projection decoder state.
+///
+/// The owning handle cannot be moved out of this borrowed wrapper:
+///
+/// ```compile_fail
+/// use opus_codec::projection::{ProjectionDecoder, ProjectionDecoderRef};
+/// fn extract<'a>(
+///     state: &mut ProjectionDecoderRef<'a>,
+///     replacement: ProjectionDecoder,
+/// ) -> ProjectionDecoder {
+///     std::mem::replace(&mut **state, replacement)
+/// }
+/// ```
 pub struct ProjectionDecoderRef<'a> {
     inner: ProjectionDecoder,
     _marker: PhantomData<&'a mut OpusProjectionDecoder>,
@@ -848,6 +877,11 @@ impl<'a> ProjectionDecoderRef<'a> {
         }
         Ok(unsafe { Self::from_raw(ptr, sample_rate, channels, streams, coupled_streams) })
     }
+
+    delegate_ref_mut_methods! {
+        fn decode(packet: &[u8], out: &mut [i16], frame_size_per_ch: usize, fec: bool) -> Result<usize>;
+        fn decode_float(packet: &[u8], out: &mut [f32], frame_size_per_ch: usize, fec: bool) -> Result<usize>;
+    }
 }
 
 impl Deref for ProjectionDecoderRef<'_> {
@@ -855,11 +889,5 @@ impl Deref for ProjectionDecoderRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl DerefMut for ProjectionDecoderRef<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
